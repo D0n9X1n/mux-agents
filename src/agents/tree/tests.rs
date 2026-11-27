@@ -2377,6 +2377,132 @@ fn every_other_proven_member_is_still_refused_placement_tagged() {
     }
 }
 
+fn sidebar_writes(m: &Mw) -> Vec<String> {
+    m.w.fakes
+        .mux_calls()
+        .iter()
+        .filter(|c| c.iter().any(|a| a.starts_with("@mux-agents-sidebar")))
+        .filter(|c| c.iter().any(|a| a == "set-option"))
+        .map(|c| c.join(" "))
+        .collect()
+}
+
+// The `up` leader's chat is the person's: it may close the session's side bar (and toggle it), as it may choose the
+// placement; the team lock it is proven under is released before the side bar's lock is taken.
+#[test]
+fn the_up_leader_closes_the_side_bar() {
+    let m = leader_world();
+    m.rounds(3, &term(&m.r, Some(150)));
+    let (code, out) = crate::cli::run(&["sidebar", "-Close"].map(String::from), || Ok(&m.w.ctx));
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        sidebar_writes(&m),
+        ["-N set-option -t $3 @mux-agents-sidebar off"]
+    );
+    let locks = m.w.fakes.locks();
+    let team = locks.iter().position(|l| l.starts_with("-spawn|")).unwrap();
+    let bar = locks
+        .iter()
+        .position(|l| l.starts_with("+sidebar|"))
+        .unwrap();
+    assert!(team < bar, "the team lock is released first: {locks:?}");
+    m.w.fakes.hc_done().unwrap();
+}
+
+// The leader's bar opens in the window its view's pane is in now, read live and only within its own session: a pane
+// or window moved to another session of the server refuses, and opens no bar there.
+#[test]
+fn the_up_leaders_bar_opens_where_its_pane_is_now_in_its_own_session() {
+    // The session was turned off by a close; a refusal leaves it off. `gone` is a probe of a pane no longer there.
+    for (now, want) in [
+        ("$3|@6", Some("@6")),
+        ("$9|@6", None),
+        ("$9|@5", None),
+        ("gone", None),
+    ] {
+        let m = leader_world();
+        m.rounds(3, &term(&m.r, Some(150)));
+        match now {
+            "gone" => {
+                m.w.fakes
+                    .mux_first("#{session_id}|#{window_id}", 1, "", "can't find pane: %5\n")
+            }
+            _ => {
+                m.w.fakes
+                    .mux_first("#{session_id}|#{window_id}", 0, &format!("{now}\n"), "")
+            }
+        }
+        let (code, out) = crate::cli::run(&["sidebar"].map(String::from), || Ok(&m.w.ctx));
+        let looked: Vec<String> =
+            m.w.fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| {
+                    c.iter().any(|a| a == "@mux-agents-sidebar-id") && c.iter().any(|a| a == "-wqv")
+                })
+                .map(|c| c.join(" "))
+                .collect();
+        match want {
+            Some(window) => assert!(
+                looked.iter().any(|c| c.contains(&format!("-t {window} "))),
+                "{now}: {out} {looked:?}"
+            ),
+            None => {
+                assert_eq!(code, 1, "{now}: {out}");
+                assert!(out.contains("not in its team's session"), "{now}: {out}");
+                assert!(looked.is_empty(), "{now}: {looked:?}");
+                assert!(sidebar_writes(&m).is_empty(), "{now}: off stays off");
+                assert_eq!(
+                    m.w.fakes
+                        .mux_calls()
+                        .iter()
+                        .filter(|c| c[1] == "split-window")
+                        .count(),
+                    0,
+                    "{now}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_other_proven_member_is_still_refused_the_side_bar_tagged() {
+    let tagged = r#"{"ok":false,"verb":"sidebar","code":2,"check":"tagged","message":"an agent pane cannot open the side bar"}"#;
+    for case in ["member", "not-the-teams-leader"] {
+        let mut m = member_world();
+        if case == "not-the-teams-leader" {
+            (m.r["depth"], m.r["upTeam"], m.r["parentAgent"]) = (json!(0), json!("t"), Value::Null);
+            write(&m.folder(ID).join("record.json"), m.r.clone());
+        }
+        m.hc();
+        m.rounds(3, &term(&m.r, Some(150)));
+        for args in [
+            &["sidebar"][..],
+            &["sidebar", "-Close"],
+            &["sidebar", "-Toggle"],
+        ] {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+            assert_eq!((code, out.as_str()), (2, tagged), "{case} {args:?}");
+            m.rounds(3, &term(&m.r, Some(150)));
+        }
+        assert!(sidebar_writes(&m).is_empty(), "{case}");
+    }
+}
+
+// The bar by default stays a person's: the leader's own chat start (`sidebar -Auto`) opens nothing; `up` opens it.
+#[test]
+fn the_up_leaders_chat_start_opens_no_side_bar() {
+    let m = leader_world();
+    m.rounds(3, &term(&m.r, Some(150)));
+    let args = ["sidebar", "-Auto", "-Source", "startup"].map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains(r#""check":"tagged""#), "{out}");
+    assert!(sidebar_writes(&m).is_empty());
+}
+
 // cascade-3d C2: the gate every spawn passes refuses 2 `closed` under a stopped parent, after the depth check.
 #[test]
 fn admission_refuses_a_closed_parent() {

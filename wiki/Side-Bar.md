@@ -11,10 +11,15 @@ The side bar is a narrow split at the right edge of your window that lists every
 | your Claude Code or Copilot CLI chat starts or resumes in tmux or rmux | opens the bar beside it (`sidebar -Auto`); not after `clear` or `compact`, and never once you closed it |
 | the first successful `spawn` of a session | opens the bar if it is not open; later spawns reuse it |
 | `up` | opens the bar beside the team's view |
-| `sidebar` | opens it again after `sidebar -Close`, or reopens a closed one |
-| `sidebar -Close` | closes it for the rest of the session: no later spawn or chat start reopens it |
+| `sidebar` | opens it again after `sidebar -Close`, or reopens a closed one; every window that shows an agent's view gets its own |
+| `sidebar -Close` | closes it in every window for the rest of the session: no later spawn or chat start reopens it |
+| `sidebar -Toggle` | closes it as `sidebar -Close` does when any bar of the session shows, else opens it as `sidebar` does; the reply says `toggled` |
+| `/mux-agents-sidebar [open\|close\|toggle]` | the same, typed in Claude Code, with no model turn; no word toggles |
+| `/mux-agents:sidebar [open\|close\|toggle]` | the same, typed in Copilot CLI (and Claude Code), through one model turn that runs one command |
 
-Only you or a team's leader opens or closes it; a member gets `tagged`, and an agent outside a team too. A spawn that cannot open the bar still succeeds and reports `sidebarError`. In tab placement the bar stays in the window you spawned from. `sidebar -Close` closes only this bar; the Claude Code `Agents` pane, which runs `list -All` every 3 seconds, is separate.
+Only you or a team's leader opens or closes it; a member gets `tagged`, and an agent outside a team too. A spawn that cannot open the bar still succeeds and reports `sidebarError`. In tab placement the bar stays in the window you spawned from. `sidebar -Close` closes only the side bars; the Claude Code `Agents` pane, which runs `list -All` every 3 seconds, is separate.
+
+Closing an agent's tab or its split does not end the agent: it keeps running, detached, and stays on every bar left, with the bar beside your own pane. Enter on it, or a click, opens its view again where `placement` says, the same agent and terminal. A bar leaves a window only when that window's last view closed and nothing but the bar is left in it; beside your chat or a shell it stays. When no bar is left at all, `/mux-agents-sidebar` (or `sidebar`) opens one beside you that lists the agents still running.
 
 ## The team tree
 

@@ -257,10 +257,10 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "sidebar",
         values: &["Source"],
-        switches: &["Auto", "Close", "Quiet", "Stdin"],
+        switches: &["Auto", "Close", "Quiet", "Stdin", "Toggle"],
         min: 0,
         max: 0,
-        usage: "usage: mux-agent sidebar [-Close] [-Text] | sidebar -Auto (-Source <word> | -Stdin) [-Quiet]",
+        usage: "usage: mux-agent sidebar [-Close | -Toggle] [-Text] | sidebar -Auto (-Source <word> | -Stdin) [-Quiet]",
         handler: crate::sidebar::sidebar,
         text: json::lines,
     },
@@ -1028,6 +1028,25 @@ mod tests {
         assert_eq!(call(&w, &["report", "working"]).0, 2);
         // Only report takes it.
         assert_eq!(call(&w, &["list", "-Quiet"]).0, 2);
+    }
+
+    // `sidebar -Toggle -Quiet` (in either order) is as quiet as `-Close -Quiet`: nothing printed, success, whatever it
+    // did; without -Quiet the same toggle answers its reply.
+    #[test]
+    fn sidebar_toggle_quiet_prints_nothing() {
+        for order in [
+            ["sidebar", "-Toggle", "-Quiet"],
+            ["sidebar", "-Quiet", "-Toggle"],
+        ] {
+            assert_eq!(
+                call(&sidebar_world(), &order),
+                (0, String::new()),
+                "{order:?}"
+            );
+        }
+        let (code, out) = call(&sidebar_world(), &["sidebar", "-Toggle"]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains(r#""toggled":"opened""#), "{out}");
     }
 
     #[test]

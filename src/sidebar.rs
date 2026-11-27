@@ -2713,8 +2713,12 @@ fn watch_loop(
                         }
                     }
                 }
-                if lost && leave(ctx, caller) {
-                    return "view-closed";
+                if lost {
+                    match leave(ctx, caller) {
+                        Leave::Left => return "view-closed",
+                        Leave::Stayed => held = false,
+                        Leave::Kept => {}
+                    }
                 }
             }
             if recorded && keeper.tick(ctx, &caller.pane) {
@@ -4271,21 +4275,30 @@ fn console_utf8() {
 #[cfg(not(windows))]
 fn console_utf8() {}
 
-/// `sidebar [-Close]`: one bar per session, under the session's sidebar lock. Opens a split at the right edge of the
-/// caller's window (`bar_width` columns) running watch (again without -l only when the multiplexer refused the size),
-/// labelled @agent-role sidebar and recorded by its process; the proven bar is returned with opened false; -Close
+/// `sidebar [-Close | -Toggle]`: one bar per session, under the session's sidebar lock. Opens a split at the right edge
+/// of the caller's window (`bar_width` columns) running watch (again without -l only when the multiplexer refused the
+/// size), labelled @agent-role sidebar and recorded by its process; the proven bar is returned with opened false; -Close
 /// kills it only while it is still that process, and reports closed only when the pane is gone and no bar it could not
-/// prove still runs. A label is never trusted: an unproven labelled pane refuses both.
+/// prove still runs. A label is never trusted: an unproven labelled pane refuses both. The bar it opens gives every
+/// other window that shows an agent's view its own bar (the watch's walk, which reads the team's state as a person).
 /// -Close first sets the session's @mux-agents-sidebar `off` and `sidebar` unsets it, both inside the lock, so a
-/// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
+/// spawn's `ensure` never reopens a bar a returned -Close closed. -Toggle closes as -Close does when a bar of the
+/// session shows (`showing`: a window's proven bar, or this root's managed watch no record proves yet), else opens;
+/// a bar it cannot prove does not count, and the open then refuses naming it when it stands in the caller's window.
+/// Its reply adds `toggled`. Only a person's pane or the team's leader may run it (`placement::chooser`); anyone else
+/// is refused `tagged`; `-Auto` stays a person's.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let close = request.switch("Close");
+    let toggle = request.switch("Toggle");
     let auto = request.switch("Auto");
     let stdin = request.switch("Stdin");
     let given = request.value("Source").is_some();
-    // `-Source` and `-Stdin` belong to `-Auto` only, exactly one of them; `-Close` takes neither.
+    // `-Source` and `-Stdin` belong to `-Auto` only, exactly one of them; `-Close` and `-Toggle` take neither, nor
+    // each other.
     let sources = usize::from(given) + usize::from(stdin);
-    if close && auto || if auto { sources != 1 } else { sources != 0 } {
+    if usize::from(close) + usize::from(toggle) + usize::from(auto) > 1
+        || if auto { sources != 1 } else { sources != 0 }
+    {
         return Err(crate::agents::usage("sidebar"));
     }
     // A chat's `clear` or `compact` is the same session going on: the person already had the bar or closed it.
@@ -4294,9 +4307,13 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     }
     let caller = resolve(ctx)?;
     crate::cli::member_views(ctx, &caller)?;
-    crate::agents::registry::untagged(ctx, &caller, "an agent pane cannot open the side bar")?;
+    // The bar by default stays a person's: the leader's chat start never opens one (`up` does).
+    if auto {
+        crate::agents::registry::untagged(ctx, &caller, NOT_HERE)?;
+    } else {
+        crate::agents::placement::chooser(ctx, &caller, NOT_HERE)?;
+    }
     lock(ctx, &scope::shown_lock("sidebar", &caller), || {
-        let mut reply = Map::new();
         if auto {
             // The bar by default (a person's chat started or resumed): as `sidebar`, but a session whose bar the
             // person closed (`off`) keeps it closed, and the window is not marked viewed, since a chat window holds
@@ -4309,53 +4326,133 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             if read.stdout.trim_end_matches(['\r', '\n']) == "off" {
                 return Ok(skipped("off"));
             }
-        } else if !close {
+            let here = bar_window(ctx, &caller)?;
+            return open_locked(ctx, &caller, &here);
+        }
+        if !toggle {
+            return if close {
+                close_locked(ctx, &caller)
+            } else {
+                // The window first: a refusal leaves the session as it was (off stays off).
+                let here = bar_window(ctx, &caller)?;
+                native(
+                    ctx,
+                    &["set-option", "-u", "-t", &caller.session, OPTION],
+                    false,
+                )?;
+                open_locked(ctx, &caller, &here)
+            };
+        }
+        // 0.2.x's session record moves to its bar's window first, so the look below sees that bar too.
+        migrate(ctx, &caller.session)?;
+        let running = showing(ctx, &caller.session)?;
+        let mut reply = if running {
+            // A close cut short has closed some bars and turned the session off: toggling again would open them
+            // again, so the refusal says how to finish it.
+            close_locked(ctx, &caller).map_err(|mut r| {
+                if r.check == "sidebar" {
+                    r.message
+                        .push_str("; the toggle was closing: run sidebar -Close to finish");
+                }
+                r
+            })?
+        } else {
+            let here = bar_window(ctx, &caller)?;
             native(
                 ctx,
                 &["set-option", "-u", "-t", &caller.session, OPTION],
                 false,
             )?;
-        }
-        if !close {
-            migrate(ctx, &caller.session)?;
-            let (pane, window, opened) = find_or_open(ctx, &caller.window)?;
-            reply.insert("pane".into(), pane.into());
-            reply.insert("window".into(), window.into());
-            reply.insert("opened".into(), opened.into());
-            return Ok(reply);
-        }
-        native(
-            ctx,
-            &["set-option", "-t", &caller.session, OPTION, "off"],
-            false,
-        )?;
-        migrate(ctx, &caller.session)?;
-        let mut closed: Vec<String> = Vec::new();
-        for window in windows(ctx, &caller.session)? {
-            closed.extend(close_window(ctx, &caller.session, &window)?);
-        }
-        // A watch this root's split started that no record proves (its opener died before it marked it) is killed
-        // by its process (`close_strays`).
-        closed.extend(close_strays(ctx, &caller.session)?);
-        // Closed answers only with no bar left running. Nothing closed: any label refuses, as it may be a bar no
-        // record proves (a 0.2.1 bar). A bar closed: a label may be one its rotate-window moved onto another pane, so
-        // only a bar still running refuses (`running_bars`), such as one whose pane left a window that went.
-        let left = if closed.is_empty() {
-            labelled(ctx, &["-s", "-t", &caller.session])?
-        } else {
-            running_bars(ctx, &caller.session)?
+            open_locked(ctx, &caller, &here)?
         };
-        if !left.is_empty() {
-            return refuse(1, "sidebar", unproven(&left));
-        }
-        reply.insert(
-            "pane".into(),
-            closed.first().map_or(Value::Null, |p| p.clone().into()),
-        );
-        reply.insert("closed".into(), (!closed.is_empty()).into());
-        reply.insert("panes".into(), closed.into());
+        let done = if running { "closed" } else { "opened" };
+        reply.insert("toggled".into(), done.into());
         Ok(reply)
     })
+}
+
+/// The window `sidebar` opens a bar in, read before anything is written: the caller's window, or for a member (the
+/// team's leader) the window its view's pane is in now, which must be in the caller's own session. A pane, or its whole
+/// window, moved to another session of the server is not this session's to give a bar (one there would be a bar this
+/// session's -Close cannot reach), and a window keeps its id when moved, so its record's window is never trusted; a
+/// pane gone, or an answer that cannot be read, refuses as well, naming the way back.
+fn bar_window(ctx: &Ctx, caller: &Caller) -> Res<String> {
+    if caller.member.is_none() {
+        return Ok(caller.window.clone());
+    }
+    let read = native(
+        ctx,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &caller.pane,
+            "#{session_id}|#{window_id}",
+        ],
+        true,
+    )?;
+    let text = read.stdout.trim_end_matches(['\r', '\n']).to_string();
+    match text.split_once('|') {
+        Some((session, window))
+            if read.code == 0 && session == caller.session && window_id(window) =>
+        {
+            Ok(window.to_string())
+        }
+        _ => refuse(
+            1,
+            "sidebar",
+            "the leader's view is not in its team's session: run up to bring it back",
+        ),
+    }
+}
+
+/// `sidebar`'s open, under the session's sidebar lock its caller holds: the caller's window's bar, found or opened. A
+/// member (the team's leader) is in the window its view's pane is in now: its record keeps the window the view opened
+/// in, and break-pane or join-pane moves the pane without changing it.
+fn open_locked(ctx: &Ctx, caller: &Caller, here: &str) -> Res<Map<String, Value>> {
+    migrate(ctx, &caller.session)?;
+    let (pane, window, opened) = find_or_open(ctx, here)?;
+    let mut reply = Map::new();
+    reply.insert("pane".into(), pane.into());
+    reply.insert("window".into(), window.into());
+    reply.insert("opened".into(), opened.into());
+    Ok(reply)
+}
+
+/// `sidebar -Close`, under the session's sidebar lock its caller holds: the session off, then every bar closed.
+fn close_locked(ctx: &Ctx, caller: &Caller) -> Res<Map<String, Value>> {
+    native(
+        ctx,
+        &["set-option", "-t", &caller.session, OPTION, "off"],
+        false,
+    )?;
+    migrate(ctx, &caller.session)?;
+    let mut closed: Vec<String> = Vec::new();
+    for window in windows(ctx, &caller.session)? {
+        closed.extend(close_window(ctx, &caller.session, &window)?);
+    }
+    // A watch this root's split started that no record proves (its opener died before it marked it) is killed
+    // by its process (`close_strays`).
+    closed.extend(close_strays(ctx, &caller.session)?);
+    // Closed answers only with no bar left running. Nothing closed: any label refuses, as it may be a bar no
+    // record proves (a 0.2.1 bar). A bar closed: a label may be one its rotate-window moved onto another pane, so
+    // only a bar still running refuses (`running_bars`), such as one whose pane left a window that went.
+    let left = if closed.is_empty() {
+        labelled(ctx, &["-s", "-t", &caller.session])?
+    } else {
+        running_bars(ctx, &caller.session)?
+    };
+    if !left.is_empty() {
+        return refuse(1, "sidebar", unproven(&left));
+    }
+    let mut reply = Map::new();
+    reply.insert(
+        "pane".into(),
+        closed.first().map_or(Value::Null, |p| p.clone().into()),
+    );
+    reply.insert("closed".into(), (!closed.is_empty()).into());
+    reply.insert("panes".into(), closed.into());
+    Ok(reply)
 }
 
 /// `window`'s proven bar, killed only while it is still that process, then its record cleared: the pane closed,
@@ -4391,13 +4488,32 @@ fn close_window(ctx: &Ctx, session: &str, window: &str) -> Res<Option<String>> {
 /// not take refuses, as `close_window` does, so -Close never answers closed with that watch running. An unreadable
 /// list refuses: it may hold such a watch.
 fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
+    let mut closed: Vec<String> = Vec::new();
+    for (pane, pid) in strays(ctx, session)? {
+        if !kill_bar(ctx, &pane, pid) {
+            return refuse(
+                1,
+                "sidebar",
+                format!(
+                    "the side bar {pane} did not close: the pane no longer runs this session's side bar"
+                ),
+            );
+        }
+        closed.push(pane);
+    }
+    Ok(closed)
+}
+
+/// The live panes of `session` whose process is this state root's managed watch (`split_watch`), with their pid, read
+/// and never killed: what `close_strays` closes, and what `showing` counts. An unreadable list refuses.
+fn strays(ctx: &Ctx, session: &str) -> Res<Vec<(String, u32)>> {
     let key = root_key(ctx);
     let listed = native(
         ctx,
         &["list-panes", "-s", "-t", session, "-F", MARK_FORMAT],
         false,
     )?;
-    let mut closed: Vec<String> = Vec::new();
+    let mut found: Vec<(String, u32)> = Vec::new();
     for line in listed.stdout.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let mut fields = line.splitn(4, '|');
@@ -4408,21 +4524,28 @@ fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
         let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
-        if !pane_id(pane) || !split_watch(ctx, pid, &key) {
-            continue;
+        if pane_id(pane) && split_watch(ctx, pid, &key) {
+            found.push((pane.to_string(), pid));
         }
-        if !kill_bar(ctx, pane, pid) {
-            return refuse(
-                1,
-                "sidebar",
-                format!(
-                    "the side bar {pane} did not close: the pane no longer runs this session's side bar"
-                ),
-            );
-        }
-        closed.push(pane.to_string());
     }
-    Ok(closed)
+    Ok(found)
+}
+
+/// Whether a bar of `session` shows that `close_locked` would close: a window's proven bar, or this root's managed
+/// watch no record proves yet. Nothing is killed. A bar that cannot be proven (a 0.2.1 bar, a watch a person ran) is
+/// not one: the open that follows refuses naming it when it stands in the caller's window, as `sidebar` does.
+fn showing(ctx: &Ctx, session: &str) -> Res<bool> {
+    for window in windows(ctx, session)? {
+        // A window gone since the list took its bar with it, as `close_window` reads it.
+        let read = &["show-options", "-wqv", "-t", &window, RECORD];
+        if on_window(ctx, session, &window, read)?
+            .and_then(|read| prove_read(ctx, &window, &read))
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(!strays(ctx, session)?.is_empty())
 }
 
 /// Whether `pid` is this binary run as `<binary> watch -Managed <key>`: a watch a bar's split under the state root of
@@ -4506,6 +4629,9 @@ fn root_key_with(ctx: &Ctx, random: &dyn Fn(&mut [u8]) -> std::io::Result<()>) -
         Err(_) => mine,
     }
 }
+
+/// Who may not open or close the bar: an agent's pane, or a member that is not the team's leader.
+const NOT_HERE: &str = "an agent pane cannot open the side bar";
 
 /// `q` then `y`: the bar closes as `sidebar -Close` closes it, for its own window only, in this process. Under the
 /// session's sidebar lock the session turns `off` (else another window's bar would open this one again on its next
@@ -4875,10 +5001,45 @@ fn is_status(ctx: &Ctx, window: &str) -> bool {
         .is_ok_and(|read| read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == "1")
 }
 
-fn leave(ctx: &Ctx, caller: &Caller) -> bool {
+fn leave(ctx: &Ctx, caller: &Caller) -> Leave {
     lock(ctx, &scope::shown_lock("sidebar", caller), || {
         if view_windows(ctx, caller).is_none_or(|windows| windows.contains(&caller.window)) {
-            return Ok(false);
+            return Ok(Leave::Kept);
+        }
+        // The window still holds a live pane of its own beside the bar, and no view: the person's (their chat, or a
+        // shell). The bar stays there, as a bar opened beside a chat does, so the agents that still run stay in sight
+        // and open again from it; only a window the bar would be alone in loses it. A list that cannot be read proves
+        // nothing: the bar keeps its place and asks again next tick.
+        let listed = native(
+            ctx,
+            &[
+                "list-panes",
+                "-t",
+                &caller.window,
+                "-F",
+                "#{pane_dead}|#{pane_id}",
+            ],
+            true,
+        );
+        let Some(listed) = listed.ok().filter(|read| read.code == 0) else {
+            return Ok(Leave::Kept);
+        };
+        let others = listed.stdout.lines().any(|line| {
+            line.split_once('|')
+                .is_some_and(|(dead, pane)| dead == "0" && pane_id(pane) && pane != caller.pane)
+        });
+        if others {
+            // Stayed only once the window no longer counts as one that held a view; else the next tick would count
+            // it held again and come back here.
+            let unset = native(
+                ctx,
+                &["set-option", "-wu", "-t", &caller.window, VIEWED],
+                true,
+            );
+            return Ok(match unset {
+                Ok(out) if out.code == 0 => Leave::Stayed,
+                _ => Leave::Kept,
+            });
         }
         let unlabel = unlabel_command(&caller.pane, ctx.pid);
         let unlabel: Vec<&str> = unlabel.iter().map(String::as_str).collect();
@@ -4899,9 +5060,18 @@ fn leave(ctx: &Ctx, caller: &Caller) -> bool {
             &["set-option", "-wu", "-t", &caller.window, VIEWED],
             true,
         );
-        Ok(true)
+        Ok(Leave::Left)
     })
-    .unwrap_or(false)
+    .unwrap_or(Leave::Kept)
+}
+
+/// What `leave` did: the bar left, kept its place (a view there again, an unread list or a lock not taken: asked
+/// again next tick), or stayed beside the person's pane (its window no longer counts as one that held a view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leave {
+    Left,
+    Kept,
+    Stayed,
 }
 
 /// The conditional removal of `pane`'s side-bar label, only while it is alive and still runs `pid`.
@@ -12525,6 +12695,8 @@ mod tests {
     fn keep_world(probes: &[&'static str], win: Win) -> (World, Shared) {
         let w = watch_world(probes);
         own_watch(&w);
+        // A leaving bar's read of its window's panes: by default it is alone there, so it leaves.
+        w.fakes.mux_script(OTHERS, |_| Ok(out(0, "0|%7\n", "")));
         let shared = Rc::new(RefCell::new(win));
         let s = shared.clone();
         w.fakes.mux_script("#{pane_active}", move |argv| {
@@ -14844,6 +15016,8 @@ mod tests {
     const UNLABEL: &str = "-N if-shell -F -t %7 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},4242}} set-option -p -u -t %7 \
                            @agent-role";
     const CLEAR_OWN: &str = "-N set-option -wu -t @1 @mux-agents-sidebar-id";
+    // A leaving bar's read of its window's panes, with whether each is dead.
+    const OTHERS: &str = "#{pane_dead}|#{pane_id}";
 
     // the recorded bar leaves once its window, having held a member view, lost its last one (closed, or dead):
     // under the session lock it unlabels its own pane and clears its window's record, then ends `view-closed`.
@@ -15528,6 +15702,123 @@ mod tests {
         assert!(adopted.get(), "the self-exit took the session lock");
         let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
         assert!(!all.iter().any(|c| c == UNLABEL || c == UNMARK));
+    }
+
+    // A bar whose window lost its last view, but still holds the person's own pane (their chat, split beside the view
+    // that closed), stays: it is how the person sees the agent that still runs, and opens its view again. The window is
+    // no longer marked viewed, so the bar does not try to leave every tick; it ends only when its own pane goes.
+    #[test]
+    fn a_bar_stays_beside_the_persons_pane_when_its_last_view_closes() {
+        let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", in_place()));
+        views_by_tick(&w, "@1", 2, "closed");
+        w.fakes.mux_first(OTHERS, 0, "0|%1\n0|%7\n", "");
+        let (ended, _) = watch_run(&w);
+        assert_eq!(ended, "pane-closed", "it never leaves for want of views");
+        let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+        assert!(
+            !all.iter().any(|c| c == UNLABEL || c == CLEAR_OWN),
+            "{all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|c| c == "-N set-option -wu -t @1 @mux-agents-viewed"),
+            "{all:?}"
+        );
+        // It decided once, under the session lock: one read of its window's panes, not one each tick.
+        assert_eq!(
+            all.iter().filter(|c| c.ends_with(OTHERS)).count(),
+            1,
+            "{all:?}"
+        );
+        // A dead pane beside it is no person's: the bar leaves, as it does alone.
+        let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", in_place()));
+        views_by_tick(&w, "@1", 2, "closed");
+        w.fakes.mux_first(OTHERS, 0, "1|%1\n0|%7\n", "");
+        assert_eq!(watch_run(&w).0, "view-closed");
+    }
+
+    // A window-panes read that fails is no proof the person's pane is gone, and an unset of `viewed` that fails would
+    // let the next tick count the window held again: either way the bar keeps its place and decides again next tick.
+    #[test]
+    fn a_leaving_bar_that_cannot_read_its_window_keeps_its_place() {
+        for case in ["list", "unset"] {
+            let (w, _) = keep_world(
+                &["live", "live", "live", "live", "gone"],
+                win("%1", in_place()),
+            );
+            views_by_tick(&w, "@1", 2, "closed");
+            match case {
+                "list" => w.fakes.mux_first(OTHERS, 1, "", "no server\n"),
+                _ => {
+                    w.fakes.mux_first(OTHERS, 0, "0|%1\n0|%7\n", "");
+                    w.fakes.mux_first(
+                        "set-option -wu -t @1 @mux-agents-viewed",
+                        1,
+                        "",
+                        "no server\n",
+                    );
+                }
+            }
+            let (ended, _) = watch_run(&w);
+            assert_eq!(ended, "pane-closed", "{case}");
+            let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+            assert!(
+                !all.iter().any(|c| c == UNLABEL || c == CLEAR_OWN),
+                "{case}: {all:?}"
+            );
+            // It asked again on a later tick.
+            assert!(
+                all.iter().filter(|c| c.ends_with(OTHERS)).count() >= 2,
+                "{case}: {all:?}"
+            );
+        }
+    }
+
+    // A bar that stayed beside the person's pane is armed again by a view there: when that view goes too and the
+    // person's pane has gone meanwhile, the bar leaves as a bar alone does.
+    #[test]
+    fn a_bar_that_stayed_leaves_after_a_new_view_there_goes_and_it_is_alone() {
+        let (w, _) = keep_world(
+            &[
+                "live", "live", "live", "live", "live", "live", "live", "gone",
+            ],
+            win("%1", in_place()),
+        );
+        // Ticks 0-1: the view; 2-3: none (stays: the person's pane is there); 4-5: a view again; then none, alone.
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script("#{pane_start_command}", move |argv| {
+            let probed = fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| c.last().is_some_and(|a| a == WATCH_PROBE))
+                .count();
+            let row = "%9|@1|300|aaaaaaaaaaaa|worker";
+            let rows: &[&str] = if probed < 2 || (4..6).contains(&probed) {
+                &[row]
+            } else {
+                &[]
+            };
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed_dead(argv, rows, "\n", &[]),
+                "",
+            ))
+        });
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script(OTHERS, move |_| {
+            let probed = fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| c.last().is_some_and(|a| a == WATCH_PROBE))
+                .count();
+            Ok(out(
+                0,
+                if probed < 4 { "0|%1\n0|%7\n" } else { "0|%7\n" },
+                "",
+            ))
+        });
+        let (ended, _) = watch_run(&w);
+        assert_eq!(ended, "view-closed");
     }
 
     // QA: the window's `@mux-agents-viewed` (set by the verb that placed the view) makes it held, even when the
@@ -16562,6 +16853,239 @@ mod tests {
             )
         );
         assert_eq!(ensure_run(&w), "existing %8");
+    }
+
+    // -Toggle: with no bar running in the session it opens, as `sidebar` does; with one running in any window it closes
+    // every bar, as -Close does. Each reply says which it did.
+    #[test]
+    fn toggle_opens_when_no_bar_runs_and_closes_every_bar_when_one_does() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(
+            run(&w, &["-Toggle"]),
+            r#"ok {"pane":"%7","window":"@1","opened":true,"toggled":"opened"}"#
+        );
+        // Nothing shows (no window holds a proven bar, no stray of this root's): it opens.
+        assert_eq!(
+            calls(&w)[..5],
+            [SESSION_RECORD, WINDOWS, READ_RECORD, STRAYS, ON]
+        );
+        assert_eq!(option(&panes), None);
+        // A bar in another window only: toggle still sees it, and closes both.
+        assert_eq!(ensure_in(&w, "@2"), "opened %8");
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, &["-Toggle"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7","%8"],"toggled":"closed"}"#
+        );
+        // @1's bar is proven, so it reads no further and closes.
+        assert_eq!(calls(&w)[..4], [SESSION_RECORD, WINDOWS, READ_RECORD, OFF]);
+        assert_eq!(option(&panes).as_deref(), Some("off"));
+        assert_eq!(roles(&panes), "%1=|,%2=other|");
+        // Closed, and off: the next toggle opens again and turns the session back on.
+        assert_eq!(
+            run(&w, &["-Toggle"]),
+            r#"ok {"pane":"%9","window":"@1","opened":true,"toggled":"opened"}"#
+        );
+        assert_eq!(option(&panes), None);
+    }
+
+    // A bar no record proves (a 0.2.1 bar, a watch a person ran) is not counted as showing: toggle opens, and the open
+    // refuses naming it, as `sidebar` does, so no second bar opens beside it.
+    #[test]
+    fn toggle_counts_a_running_bar_it_cannot_prove_and_opens_nothing() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                legacy: true,
+                ..Mux::default()
+            },
+        );
+        let reply = run(&w, &["-Toggle"]);
+        assert!(reply.starts_with("1 sidebar "), "{reply}");
+        assert!(reply.contains("%7"), "{reply}");
+        assert_eq!(count(&w, "split-window"), 0);
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
+    }
+
+    // Toggle reads the running bars under the session's sidebar lock, before it writes anything.
+    #[test]
+    fn toggle_decides_under_the_sidebar_lock() {
+        let (w, _) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                ..Mux::default()
+            },
+        );
+        let fakes = w.fakes.clone();
+        let at = Rc::new(Cell::new(0usize));
+        let seen = at.clone();
+        w.fakes.lock_probe(move |event| match event.chars().next() {
+            Some('+') => {
+                seen.set(fakes.mux_calls().len());
+                String::new()
+            }
+            Some('-') => fakes.mux_calls()[seen.get()..]
+                .iter()
+                .map(|c| c.join(" "))
+                .collect::<Vec<_>>()
+                .join(","),
+            _ => String::new(),
+        });
+        run(&w, &["-Toggle"]);
+        let key = w.caller().server_key;
+        let held = w
+            .fakes
+            .locks()
+            .into_iter()
+            .find(|l| l.starts_with(&format!("-sidebar|{key}|$3")))
+            .expect("the sidebar lock");
+        // The first calls under the lock read which bars show; the close follows them.
+        assert!(
+            held.starts_with(&format!(
+                "-sidebar|{key}|$3 {SESSION_RECORD},{WINDOWS},{READ_RECORD},-N display-message -p -t %7 {PROOF},{OFF}"
+            )),
+            "{held}"
+        );
+    }
+
+    // A toggle whose close is cut short (a kill that did not take) refuses as -Close does, and says how to finish: the
+    // session is off and toggling again would open the closed bars again.
+    #[test]
+    fn a_toggle_whose_close_is_cut_short_says_to_finish_with_close() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                kill_fail: Some("exit"),
+                ..Mux::default()
+            },
+        );
+        let reply = run(&w, &["-Toggle"]);
+        assert!(reply.starts_with("1 "), "{reply}");
+        assert!(
+            reply.ends_with("; the toggle was closing: run sidebar -Close to finish"),
+            "{reply}"
+        );
+        assert_eq!(option(&panes).as_deref(), Some("off"));
+        // A plain -Close's refusal carries no such hint.
+        let (w, _) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                kill_fail: Some("exit"),
+                ..Mux::default()
+            },
+        );
+        assert!(!run(&w, &["-Close"]).contains("the toggle"));
+    }
+
+    // A bar only in another window (none in the caller's) still shows: toggle closes it, opening nothing here.
+    #[test]
+    fn toggle_closes_a_bar_that_shows_only_in_another_window() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_in(&w, "@2"), "opened %7");
+        assert_eq!(
+            run(&w, &["-Toggle"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7"],"toggled":"closed"}"#
+        );
+        assert_eq!(count(&w, "split-window"), 1, "only ensure's split");
+        assert_eq!(roles(&panes), "%1=|,%2=other|");
+    }
+
+    // A watch this root's bar split started that no record proves yet (its opener died before it recorded it) shows
+    // too: toggle closes it rather than opening a second bar beside it.
+    #[test]
+    fn toggle_closes_this_roots_unrecorded_bar() {
+        let (mut w, panes) = sidebar_world("", Mux::default());
+        let tmp = crate::testing::TempDir::new();
+        let root = tmp.path().join("state");
+        w.ctx.state_root = root.clone();
+        let exe = w.ctx.exe.display().to_string();
+        let key = key_of(&mut w, &root);
+        set(&panes, "%9", "|".into());
+        set(&panes, "pid %9", "109".into());
+        set(&panes, "win %9", "@2".into());
+        w.fakes.process(crate::proc::Row {
+            argv: Some(vec![exe.clone(), "watch".into(), "-Managed".into(), key]),
+            ..watch_row(109, &exe)
+        });
+        assert_eq!(
+            run(&w, &["-Toggle"]),
+            r#"ok {"pane":"%9","closed":true,"panes":["%9"],"toggled":"closed"}"#
+        );
+        assert_eq!(count(&w, "split-window"), 0);
+    }
+
+    // 0.2.x's session record of a bar still running moves to its window before toggle looks: toggle sees that bar
+    // and closes it, as -Close would, rather than answering opened for a bar already on screen.
+    #[test]
+    fn toggle_sees_a_bar_only_the_old_session_record_names() {
+        let (w, _) = sidebar_world(
+            "",
+            Mux {
+                legacy: true,
+                extra: vec![(RECORD, "%7 107 1070".into())],
+                ..Mux::default()
+            },
+        );
+        let got = run(&w, &["-Toggle"]);
+        assert_eq!(
+            got,
+            r#"ok {"pane":"%7","closed":true,"panes":["%7"],"toggled":"closed"}"#
+        );
+        assert_eq!(count(&w, "split-window"), 0);
+    }
+
+    // A window destroyed between toggle's list of the windows and the read of its record took its bar with it: toggle
+    // goes on to the next window, as -Close does, and finds the bar there.
+    #[test]
+    fn toggle_skips_a_window_gone_before_its_record_is_read() {
+        let (w, _) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_in(&w, "@1"), "opened %7");
+        w.fakes.clear_log();
+        w.fakes.mux_first(
+            "show-options -wqv -t @2 @mux-agents-sidebar-id",
+            1,
+            "",
+            "can't find window: @2\n",
+        );
+        // The first list names @2; the one after its failed read no longer does.
+        let listed = Rc::new(Cell::new(0));
+        w.fakes.mux_script("list-windows", move |_| {
+            listed.set(listed.get() + 1);
+            Ok(out(
+                0,
+                if listed.get() == 1 {
+                    "@2\n@1\n"
+                } else {
+                    "@1\n"
+                },
+                "",
+            ))
+        });
+        let got = run(&w, &["-Toggle"]);
+        assert!(got.contains(r#""toggled":"closed""#), "{got}");
+    }
+
+    // -Toggle takes no -Close, -Auto, -Source or -Stdin: each is the usage line, and nothing is read or written.
+    #[test]
+    fn toggle_with_another_form_is_usage() {
+        for args in [
+            &["-Toggle", "-Close"][..],
+            &["-Toggle", "-Auto", "-Source", "startup"],
+            &["-Toggle", "-Auto", "-Stdin"],
+            &["-Toggle", "-Source", "startup"],
+            &["-Toggle", "-Stdin"],
+        ] {
+            let (w, _) = sidebar_world("", Mux::default());
+            let reply = run(&w, args);
+            assert!(
+                reply.starts_with("2 usage usage: mux-agent sidebar"),
+                "{args:?}: {reply}"
+            );
+            assert!(w.fakes.mux_calls().is_empty(), "{args:?}");
+        }
     }
 
     #[test]

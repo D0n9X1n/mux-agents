@@ -79,6 +79,26 @@ fn gated<T>(ctx: &Ctx, caller: &Caller, f: impl FnOnce() -> Res<T>) -> Res<T> {
 
 const NOT_HERE: &str = "an agent pane cannot choose where agents open";
 
+/// Refuses 2 `tagged` with `message` unless `caller` is a person's pane (untagged, no agent's own) or the depth-0
+/// leader `up` launched, proven under the team lock as `gated` proves it. The lock is released before this returns, so
+/// a caller that then takes another lock (the side bar's) nests no lock inside the team lock.
+pub(crate) fn chooser(ctx: &Ctx, caller: &Caller, message: &str) -> Res<()> {
+    if caller.member.is_some() {
+        return super::tree::with_standing(ctx, caller, |standing| {
+            let leads = match standing {
+                Some(super::tree::Standing::Member(m)) => super::tree::leads(ctx, caller, m)?,
+                _ => false,
+            };
+            if leads {
+                Ok(())
+            } else {
+                crate::error::refuse(2, "tagged", message)
+            }
+        });
+    }
+    super::registry::untagged(ctx, caller, message)
+}
+
 /// Sets `value` on the caller's session, or reads the session's placement when there is none.
 fn choose(ctx: &Ctx, caller: &Caller, value: Option<&'static str>) -> Res<Map<String, Value>> {
     let (placement, source) = match value {

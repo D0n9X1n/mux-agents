@@ -3908,8 +3908,8 @@ hc {}:
         assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
     }
 
-    // QA: break-pane moves the window's last view to a new window. The old bar, before it leaves, gives that
-    // window its own bar; nothing else would (no other bar runs). Each of `bars` is `<pane>|<window>|<width>`.
+    // QA: break-pane moves the window's last view to a new window. The old bar gives that window its own bar, and
+    // itself stays beside the person's pane, which is still in its window. Each of `bars` is `<pane>|<window>|<width>`.
     fn break_pane_of_the_last_view_gives_its_new_window_a_bar(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -3932,14 +3932,20 @@ hc {}:
         live.call(&["break-pane", "-d", "-s", &pane]);
         let window = live.field(&pane, "#{window_id}");
         assert_ne!(window, s(&w1["window"]), "{mux:?}");
-        live.wait_gone(&bar);
         live.server.wait("a bar in the view's new window", || {
             live.bars()
                 .iter()
                 .any(|b| b.split('|').nth(1) == Some(window.as_str()))
                 .then_some(())
         });
-        assert_eq!(live.bars().len(), 1, "{mux:?} {:?}", live.bars());
+        assert!(
+            live.bars()
+                .iter()
+                .any(|b| b.starts_with(&format!("{bar}|"))),
+            "{mux:?}: the bar beside the person left: {:?}",
+            live.bars()
+        );
+        assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
     }
 
     // A watch ended while its worker opens another window's bar waits for that open, so the new bar is marked (the
@@ -4280,6 +4286,175 @@ hc {}:
                 assert_eq!(exit_messages(&live, w).len(), 1);
             }
         }
+    }
+
+    // The person closes the split that showed their only agent, in their own window: the bar beside them stays, the
+    // agent keeps running detached on it, and Enter on its row opens its view again, the same agent and terminal.
+    fn a_closed_split_agent_stays_on_the_bar_and_enter_opens_it_again(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &["-Split", "h"]);
+        let bar = s(&w1["sidebar"]).to_string();
+        let pid = live.worker_pid(&w1);
+        live.log_frames(&bar);
+        live.call(&["kill-pane", "-t", s(&w1["pane"])]);
+        live.wait_gone(s(&w1["pane"]));
+        // Long enough for the bar to see its window lost its last view and decide (it stays: the person's pane is
+        // there).
+        live.wait_tick(&bar);
+        live.wait_tick(&bar);
+        assert!(
+            live.bars()
+                .iter()
+                .any(|b| b.starts_with(&format!("{bar}|"))),
+            "{mux:?}: the bar beside the person left: {:?}",
+            live.bars()
+        );
+        let mut screen = String::new();
+        assert!(
+            eventually(Duration::from_secs(10), || {
+                screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+                row_at(&screen, "w1").is_some()
+            }),
+            "{mux:?}: w1 is not on the bar:\n{screen}"
+        );
+        live.after_quiet_redraw(&bar);
+        live.call(&["send-keys", "-t", &bar, "-l", "j"]);
+        live.call(&["send-keys", "-t", &bar, "Enter"]);
+        let mut view = String::new();
+        assert!(
+            eventually(Duration::from_secs(15), || {
+                view = live
+                    .panes("#{pane_id}|#{@agent-name}")
+                    .iter()
+                    .find(|r| r.ends_with("|w1"))
+                    .map(|r| r.split('|').next().unwrap().to_string())
+                    .unwrap_or_default();
+                !view.is_empty()
+            }),
+            "{mux:?}: Enter opened no view of w1"
+        );
+        assert_ne!(view, s(&w1["pane"]), "{mux:?}");
+        let (code, list) = live.run(&["list"]);
+        assert_eq!(code, 0, "{mux:?} {list}");
+        let row = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "w1")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            (&row["life"], &row["hcAddress"]),
+            (&json!("running"), &w1["hcAddress"]),
+            "{mux:?} {row}"
+        );
+        assert_eq!(
+            live.worker_pid(&w1),
+            pid,
+            "{mux:?}: the same client, not a new one"
+        );
+    }
+
+    // The person closes an agent's whole tab: its bar goes with it, the agent keeps running, the bar beside the person
+    // still lists it, and Enter opens its view again as a tab, which gets its own bar.
+    fn a_closed_agent_tab_stays_on_the_persons_bar_and_enter_opens_it_again(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (code, open) = live.run(&["sidebar"]);
+        assert_eq!(code, 0, "{mux:?} {open}");
+        let mine = s(&open["pane"]).to_string();
+        let w1 = live.spawn("w1", &["-Tab"]);
+        let pid = live.worker_pid(&w1);
+        live.log_frames(&mine);
+        live.call(&["kill-window", "-t", s(&w1["window"])]);
+        live.wait_gone(s(&w1["pane"]));
+        let mut screen = String::new();
+        assert!(
+            eventually(Duration::from_secs(10), || {
+                screen = live.call(&["capture-pane", "-p", "-t", &mine]);
+                row_at(&screen, "w1").is_some()
+            }),
+            "{mux:?}: w1 left the person's bar:\n{screen}"
+        );
+        live.after_quiet_redraw(&mine);
+        live.call(&["send-keys", "-t", &mine, "-l", "j"]);
+        live.call(&["send-keys", "-t", &mine, "Enter"]);
+        let mut view = String::new();
+        assert!(
+            eventually(Duration::from_secs(15), || {
+                view = live
+                    .panes("#{pane_id}|#{@agent-name}")
+                    .iter()
+                    .find(|r| r.ends_with("|w1"))
+                    .map(|r| r.split('|').next().unwrap().to_string())
+                    .unwrap_or_default();
+                !view.is_empty()
+            }),
+            "{mux:?}: Enter opened no view of w1"
+        );
+        let window = live.field(&view, "#{window_id}");
+        live.server.wait("a bar in the reopened view's window", || {
+            live.bars()
+                .iter()
+                .any(|b| b.split('|').nth(1) == Some(window.as_str()))
+                .then_some(())
+        });
+        assert_eq!(
+            live.worker_pid(&w1),
+            pid,
+            "{mux:?}: the same client, not a new one"
+        );
+    }
+
+    // `sidebar -Toggle` from the person's pane: with bars showing in their window and an agent's tab, it closes both;
+    // again, it opens the person's, which gives the agent's window its own; a third time closes both again.
+    fn toggle_closes_and_opens_the_bar_in_every_agent_window(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (code, open) = live.run(&["sidebar"]);
+        assert_eq!(code, 0, "{mux:?} {open}");
+        let w1 = live.spawn("w1", &["-Tab"]);
+        live.worker_pid(&w1);
+        let agent_window = s(&w1["window"]).to_string();
+        let has_bar = |live: &Live, window: &str| {
+            live.bars()
+                .iter()
+                .any(|b| b.split('|').nth(1) == Some(window))
+        };
+        live.server.wait("the agent window's bar", || {
+            has_bar(&live, &agent_window).then_some(())
+        });
+        assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
+        let (code, off) = live.run(&["sidebar", "-Toggle"]);
+        assert_eq!(code, 0, "{mux:?} {off}");
+        assert_eq!(off["toggled"], "closed", "{mux:?} {off}");
+        assert_eq!(
+            off["panes"].as_array().map(Vec::len),
+            Some(2),
+            "{mux:?} {off}"
+        );
+        for pane in off["panes"].as_array().unwrap() {
+            live.wait_gone(pane.as_str().unwrap());
+        }
+        assert!(live.bars().is_empty(), "{mux:?} {:?}", live.bars());
+        let (code, on) = live.run(&["sidebar", "-Toggle"]);
+        assert_eq!(code, 0, "{mux:?} {on}");
+        assert_eq!(
+            (&on["toggled"], &on["opened"]),
+            (&json!("opened"), &json!(true)),
+            "{mux:?} {on}"
+        );
+        live.server.wait("the agent window's bar again", || {
+            has_bar(&live, &agent_window).then_some(())
+        });
+        assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
+        let (code, again) = live.run(&["sidebar", "-Toggle"]);
+        assert_eq!(code, 0, "{mux:?} {again}");
+        assert_eq!(again["toggled"], "closed", "{mux:?} {again}");
     }
 
     // Watch preserves detached members and reaps only terminal completion.
@@ -6926,6 +7101,9 @@ hc {}:
                     three_agents_in_three_windows_each_get_one_proven_bar,
                     gone_pane_closed_by_each_trigger,
                     bar_drops_a_gone_agent,
+                    a_closed_split_agent_stays_on_the_bar_and_enter_opens_it_again,
+                    a_closed_agent_tab_stays_on_the_persons_bar_and_enter_opens_it_again,
+                    toggle_closes_and_opens_the_bar_in_every_agent_window,
                     bar_shows_waiting_then_working,
                     bar_keeps_its_header_with_emoji_sequences,
                     dead_pane_closed_by_one_conditional,

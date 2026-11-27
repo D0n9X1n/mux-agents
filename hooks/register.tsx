@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { activity, reportSession } from './activity'
-import { arm, onSubmit, run } from './deliver'
+import { argv, arm, onSubmit, run } from './deliver'
 import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList, sections } from './board'
 
 const PANE = 'mux-agents'
@@ -137,6 +137,42 @@ async function openPane($: EngineInterface): Promise<boolean> {
   return true
 }
 
+// /mux-agents-sidebar's word to the entry's `sidebar` form: none or `toggle`, `open`, `close`; any other is undefined.
+const SIDEBAR_FORMS: Record<string, string[]> = { '': ['sidebar', '-Toggle'], toggle: ['sidebar', '-Toggle'], open: ['sidebar'], close: ['sidebar', '-Close'] }
+const SIDEBAR_USAGE = 'usage: /mux-agents-sidebar [open|close|toggle]'
+
+// The person's /mux-agents-sidebar: one run of the entry's `sidebar`, with no model turn. The binary decides who may
+// (a person's chat or the team's leader; an agent's pane is refused `tagged`) and which bars open or close; its one JSON
+// line becomes one line of text. Run through `argv` (deliver.ts), not `run`, which stops mail delivery on a `tagged`
+// answer. A close walks every window, so it may take longer than a mail read.
+async function sidebarCommand($: EngineInterface, args: string): Promise<string> {
+  const word = args.trim().toLowerCase()
+  // Own keys only: a word such as `constructor` is no form.
+  const form = Object.hasOwn(SIDEBAR_FORMS, word) ? SIDEBAR_FORMS[word] : undefined
+  if (!form) return SIDEBAR_USAGE
+  let r: Record<string, unknown> | undefined
+  try {
+    const ran = await $.process.run(await argv($, form), { timeoutMs: 30000 })
+    r = JSON.parse(ran.stdout.trim().split('\n').at(-1) ?? '') as Record<string, unknown>
+  } catch {
+    r = undefined
+  }
+  const silent = 'mux-agents: the side bar command did not answer.'
+  if (!r || typeof r !== 'object') return silent
+  if (r.ok === false) return `mux-agents: ${String(r.message ?? r.check ?? 'refused')}`
+  // Only a reply that says what it did is shown as done.
+  if (typeof r.closed === 'boolean') {
+    // Only a list of pane names says which bars closed; closed with none named, or not closed with one named,
+    // contradicts itself. Either way nothing is shown as done.
+    if (!Array.isArray(r.panes) || !r.panes.every(p => typeof p === 'string' && p !== '')) return silent
+    const panes = r.panes as string[]
+    if (r.closed !== panes.length > 0) return silent
+    return r.closed ? `Side bar closed: ${panes.join(', ')}.` : 'Side bar was already off.'
+  }
+  if (typeof r.opened !== 'boolean' || typeof r.pane !== 'string' || !r.pane) return silent
+  return `${r.opened ? 'Side bar opened' : 'Side bar is on'}: ${r.pane}. Every agent window gets its own.`
+}
+
 // After a Bash or PowerShell call: opens the pane when the call was a successful spawn in an eligible session.
 async function openAfterSpawn($: EngineInterface, command: string, stdout: string | undefined) {
   if (isSpawn(command, stdout) && (await eligible($))) await openPane($)
@@ -171,10 +207,25 @@ export const register: Register = on => {
   // eligible session. A refused registration (another owner of the name) leaves the session and the open-on-spawn
   // path working.
   on('session.start', async ($, e, next) => {
+    const here = await eligible($)
     try {
-      if (await eligible($)) await $.command.register({ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' })
+      if (here) await $.command.register({ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' })
     } catch {
       // The pane still opens after a spawn; only the command is missing.
+    }
+    // Its own try: a refused name for one command leaves the other registered.
+    try {
+      if (here) {
+        await $.command.register({
+          name: 'mux-agents-sidebar',
+          description: 'Open, close or toggle the side bar in every agent window of this session',
+          argumentHint: '[open|close|toggle]',
+          // Typed while a turn streams, it runs at once: it reads no turn state.
+          immediate: true,
+        })
+      }
+    } catch {
+      // The binary's `sidebar` still runs from the skill; only the typed command is missing.
     }
     // The wake timer of a member (deliver.ts): armed once per load, never with MUX_AGENTS_WAKE=0.
     await arm($).catch(() => {})
@@ -184,6 +235,11 @@ export const register: Register = on => {
   on('command.run', { command: 'mux-agents-pane' }, async $ => {
     if (!(await eligible($)) || !(await openPane($))) return { text: NOT_HERE }
     return { text: 'Agents pane opened.' }
+  })
+  // Registered while eligible does not mean eligible now: the command checks again, and runs nothing when not.
+  on('command.run', { command: 'mux-agents-sidebar' }, async ($, e) => {
+    if (!(await eligible($))) return { text: NOT_HERE }
+    return { text: await sidebarCommand($, typeof e.args === 'string' ? e.args : '') }
   })
   // A desktop, mobile or IDE client attaching: an open still pending is no longer current, and with the pane open the
   // refresh stops at once and the pane is asked to close, without holding up the attach.

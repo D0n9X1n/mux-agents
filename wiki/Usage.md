@@ -61,7 +61,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `ping` | `ping claude-1` | the team's leader or a person asks a live member for its status: a mail names a ping id, and `list` and the bar show the open ping until the member answers it |
 | `answer` | `answer <id> -BodyFile status.md` | a member answers the ping its mail named; the text becomes its status; only this answers a ping |
 | `notify` | `notify -On`, `notify -Off` | a person's opt-in: while it is on, each team send also pastes a one-line notice into each recipient's terminal |
-| `sidebar` | `sidebar`, `sidebar -Close` | reopen the side-bar split, or close it for the rest of the session |
+| `sidebar` | `sidebar`, `sidebar -Close`, `sidebar -Toggle` | open the side bar in your window, and every agent window gets its own; `-Close` closes it in every window for the rest of the session; `-Toggle` closes it when any bar shows, else opens it; typed as `/mux-agents-sidebar [open\|close\|toggle]` in Claude Code and `/mux-agents:sidebar [open\|close\|toggle]` in Copilot CLI |
 | `watch` | `watch` | draw the board in this terminal; the side bar runs it |
 | `version` | `version`, `--version` | the binary's version, to tell which one a pane runs; works outside a multiplexer |
 | `kept` | `kept`, `kept -Close t7` | list the team's kept shells (an agent's previous terminal left open after `restore`); `-Close <address>` closes one; a person's command, refused in an agent pane |
@@ -90,7 +90,7 @@ usage: mux-agent report <working|blocked|idle|done> [-Kind <permission|question>
 usage: mux-agent ping <name> [-Text]
 usage: mux-agent answer <pingId> -BodyFile <path> [-Text]
 usage: mux-agent notify (-On | -Off) [-Text]
-usage: mux-agent sidebar [-Close] [-Text]
+usage: mux-agent sidebar [-Close | -Toggle] [-Text]
 usage: mux-agent watch [-Text]
 usage: mux-agent version [-Text]
 usage: mux-agent kept [-Close <address>] [-Text]

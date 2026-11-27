@@ -150,7 +150,28 @@ $block
 END_BLOCK
 set +f
 unset MUX_AGENTS_BIN
-if [ "$n" = 38 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
+if [ "$n" = 39 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
+
+# The sidebar skill's three commands, as its bullets give them, run through the shim exactly as written.
+reset; fake "$tier1" tier1; export MUX_AGENTS_BIN="$tier1"
+why=; n=0
+set -f
+# The backquotes in the pattern are the skill's Markdown code marks, not a command substitution.
+# shellcheck disable=SC2016
+while IFS= read -r line; do
+  n=$((n + 1))
+  line=$(printf '%s\n' "$line" | sed -e "s#<entry>#$shim#")
+  want=tier1
+  for w in ${line#"$prefix"}; do want="$want
+[$w]"; done
+  got=$(eval "$line" </dev/null)
+  [ "$got" = "$want" ] || why="$why; $line logged: $got"
+done <<END_BLOCK
+$(sed -n 's/^- .*: `\("<entry>" sidebar[^`]*\)`$/\1/p' "$repo/skills/sidebar/SKILL.md")
+END_BLOCK
+set +f
+unset MUX_AGENTS_BIN
+if [ "$n" = 3 ] && [ -z "$why" ]; then ok sidebar_skill_commands_run_through_shim; else bad sidebar_skill_commands_run_through_shim "$n commands$why"; fi
 
 # Copilot reads the plugin root's hooks.json (Claude Code reads hooks/hooks.json only) and runs each command from
 # the plugin root. Every hook reports through the shim, never fails the turn, and maps Copilot's events as herdr's

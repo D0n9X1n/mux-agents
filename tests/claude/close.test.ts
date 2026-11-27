@@ -15,7 +15,9 @@ type Below = 'close' | 'deny' | 'keep'
 function engine() {
   const hooks: Record<string, { matcher?: Record<string, unknown>; fn: Function }> = {}
   register(((name: string, a: unknown, b?: unknown) => {
-    hooks[name] = typeof a === 'function' ? { fn: a } : { matcher: a as Record<string, unknown>, fn: b as Function }
+    // A hook with a command matcher is kept under its command too, so each command's hook stays reachable.
+    const command = typeof a === 'object' && a !== null ? (a as { command?: string }).command : undefined
+    hooks[command ? `${name}:${command}` : name] = typeof a === 'function' ? { fn: a } : { matcher: a as Record<string, unknown>, fn: b as Function }
   }) as never)
   const timers: { fn: () => void; cancelled: boolean }[] = []
   const closes: string[] = []
@@ -69,7 +71,7 @@ function engine() {
     failPanes: (fail: boolean) => { panesFail = fail },
     holdRuns: (on: boolean) => { hold = on },
     release: async () => { hold = false; for (const resolve of waiting.splice(0)) resolve(); await flush() },
-    open: async () => { await hooks['command.run'].fn($, { command: 'mux-agents-pane' }, async (e: unknown) => e); await flush() },
+    open: async () => { await hooks['command.run:mux-agents-pane'].fn($, { command: 'mux-agents-pane' }, async (e: unknown) => e); await flush() },
     // A close of pane `id`: the plugin's ui.close hook runs, and its next(e) is what stands beneath it (`below`).
     close: async (id: string, below: Below = 'close') => {
       const e = { id, origin: { kind: 'person' } }

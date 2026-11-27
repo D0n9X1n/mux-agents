@@ -11,10 +11,15 @@
 | 你的 Claude Code 或 Copilot CLI 对话在 tmux 或 rmux 中启动或恢复 | 在它旁边打开侧边栏（`sidebar -Auto`）；`clear` 或 `compact` 之后不打开，你关闭过它之后也不再打开 |
 | 会话中第一次成功的 `spawn` | 侧边栏未打开时打开它；之后的启动复用它 |
 | `up` | 在团队视图旁打开侧边栏 |
-| `sidebar` | 在 `sidebar -Close` 之后再次打开，或重新打开被关闭的侧边栏 |
-| `sidebar -Close` | 在本会话剩余时间内关闭它：之后的启动和对话启动都不会再打开它 |
+| `sidebar` | 在 `sidebar -Close` 之后再次打开，或重新打开被关闭的侧边栏；每个显示智能体视图的窗口也各有一个 |
+| `sidebar -Close` | 在本会话剩余时间内关闭每个窗口中的它：之后的启动和对话启动都不会再打开它 |
+| `sidebar -Toggle` | 会话中有侧边栏显示时，像 `sidebar -Close` 那样关闭它，否则像 `sidebar` 那样打开它；回复中带有 `toggled` |
+| `/mux-agents-sidebar [open\|close\|toggle]` | 同上，在 Claude Code 中输入，不经过模型回合；不带词时切换 |
+| `/mux-agents:sidebar [open\|close\|toggle]` | 同上，在 Copilot CLI（以及 Claude Code）中输入，经过一个只运行一条命令的模型回合 |
 
-只有你或团队的领导者能打开或关闭它；成员会得到 `tagged`，团队之外的智能体也一样。无法打开侧边栏的启动仍然成功，并报告 `sidebarError`。在标签页放置方式下，侧边栏留在你发起启动的窗口中。`sidebar -Close` 只关闭这个侧边栏；Claude Code 的 `Agents` 窗格每 3 秒运行一次 `list -All`，与它相互独立。
+只有你或团队的领导者能打开或关闭它；成员会得到 `tagged`，团队之外的智能体也一样。无法打开侧边栏的启动仍然成功，并报告 `sidebarError`。在标签页放置方式下，侧边栏留在你发起启动的窗口中。`sidebar -Close` 只关闭侧边栏；Claude Code 的 `Agents` 窗格每 3 秒运行一次 `list -All`，与它相互独立。
+
+关闭智能体的标签页或分屏不会结束智能体：它继续以分离状态运行，并留在剩下的每个侧边栏上，包括你自己窗格旁的侧边栏。在它上面按 Enter 或单击，会按 `placement` 再次打开它的视图，仍是同一个智能体和终端。只有当窗口的最后一个视图关闭、窗口中只剩侧边栏时，侧边栏才会离开；在你的对话或 shell 旁它会留下。一个侧边栏都不剩时，`/mux-agents-sidebar`（或 `sidebar`）会在你旁边打开一个，列出仍在运行的智能体。
 
 ## 团队树
 

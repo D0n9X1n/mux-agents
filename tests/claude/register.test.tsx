@@ -74,10 +74,12 @@ function world(on: any, env: Record<string, string>, runs: object[], tool: { std
   return { seen, clock, live }
 }
 
-test('session.start registers exactly the mux-agents-pane command', async ($, on) => {
+const SIDEBAR_COMMAND = { name: 'mux-agents-sidebar', description: 'Open, close or toggle the side bar in every agent window of this session', argumentHint: '[open|close|toggle]', immediate: true }
+
+test('session.start registers exactly the mux-agents-pane and mux-agents-sidebar commands', async ($, on) => {
   const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
   await $.session.start(START)
-  expect(seen.registered).toEqual([{ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' }])
+  expect(seen.registered).toEqual([{ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' }, SIDEBAR_COMMAND])
 })
 
 test('a refused command.register still lets session.start finish, and a spawn still opens the pane', async ($, on) => {
@@ -86,7 +88,7 @@ test('a refused command.register still lets session.start finish, and a spawn st
   let started: unknown = 'not settled'
   try { started = await $.session.start(START) } catch (err) { started = `threw ${String(err)}` }
   expect(started).toEqual({ cwd: '/' })
-  expect(seen.registered.length).toBe(1)
+  expect(seen.registered.length).toBe(2)
   await $.tool.call({ tool: 'Bash', command: SPAWN })
   await clock.settle()
   expect(seen.opened).toEqual([{ id: 'mux-agents', title: 'Agents' }])
@@ -329,7 +331,7 @@ test('on the desktop app, even inside tmux: no command, no pane, no list, and a 
 
 test('in a terminal inside tmux: the command registers, the pane opens, list refreshes and the board draws', async ($, on) => {
   const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
-  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 4 })
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 2, opened: 2, runs: 4 })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await header(ui)).toBe('mux-agents · 1 running')
   await ui.unmount()
@@ -376,7 +378,7 @@ const REFUSED = (check: string) => JSON.stringify({ ok: false, verb: 'read', cod
 
 test('a team member in an hc terminal is eligible, proven once by read -Count', async ($, on) => {
   const w = world(on, { HC_TERMINAL_ID: 't7' }, [ran(0, COUNT_OF(true)), ran(0, LIST)])
-  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 5 })
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 2, opened: 2, runs: 5 })
   expect(w.seen.argv[0]?.slice(-2)).toEqual(['read', '-Count'])
   expect(w.seen.argv.slice(1).every(a => a.at(-1) === '-All')).toBe(true)
 })
@@ -391,23 +393,23 @@ for (const [what, reply] of [['a plain herdr terminal', ran(2, REFUSED('herdr'))
 
 test('a tmux pane that inherited a herdr address is still eligible', async ($, on) => {
   const w = world(on, { TMUX: 'x', HC_TERMINAL_ID: 't7' }, [ran(0, LIST)])
-  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 4 })
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 2, opened: 2, runs: 4 })
 })
 
 test('RMUX alone, TMUX absent, is eligible', async ($, on) => {
   const w = world(on, { RMUX: 'x' }, [ran(0, LIST)])
-  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 4 })
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 2, opened: 2, runs: 4 })
 })
 
 test('CLAUDE_CODE_REMOTE other than true leaves a terminal session eligible', async ($, on) => {
   const w = world(on, { TMUX: 'x', CLAUDE_CODE_REMOTE: 'false' }, [ran(0, LIST)])
-  expect((await gated($, w)).registered).toBe(1)
+  expect((await gated($, w)).registered).toBe(2)
 })
 
 test('registered while eligible, then not: /mux-agents-pane answers not available and opens nothing', async ($, on) => {
   const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
   await $.session.start(START)
-  expect(w.seen.registered.length).toBe(1)
+  expect(w.seen.registered.length).toBe(2)
   w.live.surfaces = ['desktop']
   const answered: any = await $.command.run({ command: 'mux-agents-pane' })
   await w.clock.settle()
@@ -809,4 +811,87 @@ test('MUX_AGENTS_ASCII=1 draws herdr\'s headings with `-` too', async ($, on) =>
   expect(texts.filter((t: string) => /^\S.* - \d+$/.test(t))).toEqual(['Needs you - 1', 'Working - 1'])
   expect(texts.filter((t: string) => / claude  /.test(t))).toEqual(['! asker  claude  12s', '* builder  claude  10m'])
   await ui.unmount()
+})
+
+// /mux-agents-sidebar: the person's typed command, run with no model turn. Its word picks the form; the binary decides
+// the rest (who may, and which bars), and its one-line answer is the command's text.
+const reply = (o: object) => ran(0, JSON.stringify({ ok: true, verb: 'sidebar', ...o }))
+async function sidebar($: any, w: ReturnType<typeof world>, args: string) {
+  await $.session.start(START)
+  const answered: any = await $.command.run({ command: 'mux-agents-sidebar', args })
+  await w.clock.settle()
+  return answered?.text
+}
+
+for (const args of ['', 'toggle', '  Toggle ']) {
+  test(`/mux-agents-sidebar ${JSON.stringify(args)} runs sidebar -Toggle and says it opened`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [reply({ pane: '%7', window: '@1', opened: true, toggled: 'opened' })])
+    const root = await pluginRoot($, on)
+    expect(await sidebar($, w, args)).toBe('Side bar opened: %7. Every agent window gets its own.')
+    expect(w.seen.argv).toEqual([['sh', `${root}/scripts/mux-agent`, 'sidebar', '-Toggle']])
+  })
+}
+
+test('/mux-agents-sidebar toggling off names every bar it closed', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [reply({ pane: '%7', closed: true, panes: ['%7', '%8'], toggled: 'closed' })])
+  expect(await sidebar($, w, '')).toBe('Side bar closed: %7, %8.')
+})
+
+test('/mux-agents-sidebar open runs sidebar', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [reply({ pane: '%7', window: '@1', opened: false })])
+  expect(await sidebar($, w, 'open')).toBe('Side bar is on: %7. Every agent window gets its own.')
+  expect(w.seen.argv.map(a => a.slice(2))).toEqual([['sidebar']])
+})
+
+test('/mux-agents-sidebar close runs sidebar -Close', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [reply({ pane: null, closed: false, panes: [] })])
+  expect(await sidebar($, w, 'close')).toBe('Side bar was already off.')
+  expect(w.seen.argv.map(a => a.slice(2))).toEqual([['sidebar', '-Close']])
+})
+
+test('/mux-agents-sidebar on Windows runs the .cmd entry through cmd.exe', async ($, on) => {
+  const w = world(on, { RMUX: 'x', OS: 'Windows_NT' }, [reply({ pane: '%7', window: '@1', opened: true, toggled: 'opened' })])
+  const root = await pluginRoot($, on)
+  await sidebar($, w, '')
+  expect(w.seen.argv).toEqual([['cmd.exe', '/d', '/c', `${root}\\scripts\\mux-agent.cmd`, 'sidebar', '-Toggle']])
+})
+
+for (const args of ['off now', 'constructor', 'toString', '__proto__']) {
+  test(`/mux-agents-sidebar ${args} answers its usage and runs nothing`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [reply({})])
+    expect(await sidebar($, w, args)).toBe('usage: /mux-agents-sidebar [open|close|toggle]')
+    expect(w.seen.argv).toEqual([])
+  })
+}
+
+for (const said of [{ closed: true, panes: [] }, { closed: false, panes: ['%7'] }, { closed: true, panes: [7] }, { closed: false, panes: '%7' }, { closed: false }]) {
+  test(`/mux-agents-sidebar shows no success for a close reply that contradicts itself: ${JSON.stringify(said)}`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [reply(said)])
+    expect(await sidebar($, w, 'close')).toBe('mux-agents: the side bar command did not answer.')
+  })
+}
+
+test('/mux-agents-sidebar shows no success for a reply that names no bar', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [reply({})])
+  expect(await sidebar($, w, 'open')).toBe('mux-agents: the side bar command did not answer.')
+})
+
+test('/mux-agents-sidebar shows the binary\'s refusal', async ($, on) => {
+  const tagged = ran(2, JSON.stringify({ ok: false, verb: 'sidebar', code: 2, check: 'tagged', message: 'an agent pane cannot open the side bar' }))
+  const w = world(on, { TMUX: 'x' }, [tagged])
+  expect(await sidebar($, w, '')).toBe('mux-agents: an agent pane cannot open the side bar')
+})
+
+test('/mux-agents-sidebar says when the binary did not answer', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(1, 'not json')])
+  expect(await sidebar($, w, '')).toBe('mux-agents: the side bar command did not answer.')
+})
+
+test('/mux-agents-sidebar outside a terminal CLI in tmux answers not available and runs nothing', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [reply({})])
+  await $.session.start(START)
+  w.live.surfaces = ['desktop']
+  const answered: any = await $.command.run({ command: 'mux-agents-sidebar', args: '' })
+  await w.clock.settle()
+  expect([answered?.text, w.seen.argv.length]).toEqual([NOT_HERE, 0])
 })

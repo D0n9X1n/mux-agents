@@ -483,6 +483,21 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
     ("src/sidebar.rs", "sidebar", "the bar of the shown session"),
     (
         "src/sidebar.rs",
+        "open_locked",
+        "the bar of the shown session",
+    ),
+    (
+        "src/sidebar.rs",
+        "close_locked",
+        "the bar of the shown session",
+    ),
+    (
+        "src/sidebar.rs",
+        "bar_window",
+        "the leader's view must be in the shown session",
+    ),
+    (
+        "src/sidebar.rs",
         "ensure_locked",
         "the bar of the shown session",
     ),
@@ -2635,6 +2650,39 @@ fn tracked_frontmatter_parses() {
 
 // Terminal CLI only: the skill says where to skip it and forbids forcing it to apply; the README and both wiki
 // Usage pages state the rule and name the desktop app.
+// The person's /mux-agents:sidebar (Copilot CLI, and Claude Code): only the person runs it (the agent never picks it on
+// its own), and each word runs exactly its own form of `sidebar`, so the skill's own text cannot drift into another.
+#[test]
+fn the_sidebar_skill_runs_one_form_per_word_and_only_when_typed() {
+    let fields = frontmatter(&repo_file("skills/sidebar/SKILL.md"))
+        .expect("the sidebar skill's frontmatter");
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(field("name"), Some("sidebar"));
+    assert_eq!(field("disable-model-invocation"), Some("true"));
+    assert!(
+        field("description").is_some_and(|d| d.starts_with("Terminal CLI only:")),
+        "{fields:?}"
+    );
+    let skill = file_lines("skills/sidebar/SKILL.md");
+    for want in [
+        "- No word, or `toggle`: `\"<entry>\" sidebar -Toggle`",
+        "- `open`: `\"<entry>\" sidebar`",
+        "- `close`: `\"<entry>\" sidebar -Close`",
+        "- Any other word: run nothing, and answer `usage: /mux-agents:sidebar [open|close|toggle]`.",
+        "The word the person typed: $ARGUMENTS",
+    ] {
+        assert!(
+            skill.iter().any(|l| l == want),
+            "the sidebar skill lacks {want:?}"
+        );
+    }
+}
+
 #[test]
 fn skill_readme_and_wiki_say_terminal_cli_only() {
     let fields =

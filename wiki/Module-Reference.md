@@ -30,7 +30,7 @@ mux-agents is one Rust crate, `mux-agent` (`Cargo.toml`), edition 2024. It build
 | `launcher_scope` | The exact `launcher <spec> --state-root <abs> --path <value>` form and the environment it runs with | `argv`, `spec`, `environment` |
 | `hold` | `mux-agent hold <release file>`: the first window of a session `up` creates | `main`, `wait` |
 | `state` | The state folder: its root, privacy checks, locks and files (see below) | `state::root::root`, `state::lock::with_lock` |
-| `sidebar` | `sidebar [-Close]` opens or closes one bar per session running `watch`, and `watch` draws the board until its pane closes | `sidebar`, `watch`, `ensure`, `run_watch`, `bar_width` |
+| `sidebar` | `sidebar [-Close \| -Toggle]` opens, closes or toggles the session's bars running `watch`, and `watch` draws the board until its pane closes | `sidebar`, `watch`, `ensure`, `run_watch`, `bar_width` |
 | `paint` | Terminal text for the side bar and `list -Text`: color switches, the 16 named ANSI colors, display columns | `color_on`, `ascii`, `paint`, `hue` |
 | `util` | Hashes, random ids and the `createdAt` time text | `sha256_hex`, `hex_id`, `guid`, `utc_o`, `parse_utc` |
 | `testing` | Test only: recording fakes for the `Ctx` seams | `Fakes`, `TempDir`, `row` |

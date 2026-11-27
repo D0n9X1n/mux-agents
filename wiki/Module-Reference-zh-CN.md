@@ -30,7 +30,7 @@ mux-agents 是一个 Rust crate，名为 `mux-agent`（`Cargo.toml`），edition
 | `launcher_scope` | 精确的 `launcher <spec> --state-root <abs> --path <value>` 形式及其运行环境 | `argv`、`spec`、`environment` |
 | `hold` | `mux-agent hold <release file>`：`up` 新建会话时的第一个窗口 | `main`、`wait` |
 | `state` | 状态文件夹：根目录、私有性检查、锁和文件（见下文） | `state::root::root`、`state::lock::with_lock` |
-| `sidebar` | `sidebar [-Close]` 为每个会话打开或关闭一个运行 `watch` 的侧边栏，`watch` 绘制看板直到它的窗格关闭 | `sidebar`、`watch`、`ensure`、`run_watch`、`bar_width` |
+| `sidebar` | `sidebar [-Close \| -Toggle]` 打开、关闭或切换会话中运行 `watch` 的侧边栏，`watch` 绘制看板直到它的窗格关闭 | `sidebar`、`watch`、`ensure`、`run_watch`、`bar_width` |
 | `paint` | 侧边栏和 `list -Text` 的终端文本：颜色开关、16 种命名 ANSI 颜色、显示列宽 | `color_on`、`ascii`、`paint`、`hue` |
 | `util` | 哈希、随机 id 和 `createdAt` 时间文本 | `sha256_hex`、`hex_id`、`guid`、`utc_o`、`parse_utc` |
 | `testing` | 仅用于测试：`Ctx` 各接缝的记录型替身 | `Fakes`、`TempDir`、`row` |

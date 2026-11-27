@@ -61,7 +61,7 @@ flowchart LR
 | `ping` | `ping claude-1` | 团队的领导者或人向一个存活的成员询问状态：一封邮件写明 ping 的 id，`list` 和侧边栏显示这个未答复的 ping，直到成员答复 |
 | `answer` | `answer <id> -BodyFile status.md` | 成员答复邮件中写明的 ping；文本成为它的状态；只有它能答复 ping |
 | `notify` | `notify -On`，`notify -Off` | 由人选择开启：开启期间，每次团队发送还会把一行通知粘贴到每个接收者的终端 |
-| `sidebar` | `sidebar`，`sidebar -Close` | 重新打开侧边栏分屏，或在本会话剩余时间内关闭它 |
+| `sidebar` | `sidebar`，`sidebar -Close`，`sidebar -Toggle` | 在你的窗口中打开侧边栏，每个智能体窗口也各有一个；`-Close` 在本会话剩余时间内关闭每个窗口中的侧边栏；`-Toggle` 在有侧边栏显示时关闭它，否则打开它；在 Claude Code 中输入 `/mux-agents-sidebar [open\|close\|toggle]`，在 Copilot CLI 中输入 `/mux-agents:sidebar [open\|close\|toggle]` |
 | `watch` | `watch` | 在此终端中绘制面板；侧边栏运行的就是它 |
 | `version` | `version`，`--version` | 二进制文件的版本，用来分辨窗格运行的是哪一个；在多路复用器之外也能用 |
 | `kept` | `kept`、`kept -Close t7` | 列出团队保留的 shell（`restore` 之后留下的代理之前的终端）；`-Close <address>` 关闭其中一个；只供人使用，在代理窗格中会被拒绝 |
@@ -90,7 +90,7 @@ usage: mux-agent report <working|blocked|idle|done> [-Kind <permission|question>
 usage: mux-agent ping <name> [-Text]
 usage: mux-agent answer <pingId> -BodyFile <path> [-Text]
 usage: mux-agent notify (-On | -Off) [-Text]
-usage: mux-agent sidebar [-Close] [-Text]
+usage: mux-agent sidebar [-Close | -Toggle] [-Text]
 usage: mux-agent watch [-Text]
 usage: mux-agent version [-Text]
 usage: mux-agent kept [-Close <address>] [-Text]
