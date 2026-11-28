@@ -77,7 +77,8 @@ export function reportSession($: EngineInterface, sessionId: unknown, source: un
     await $.process.run(await entryArgv($, ['report', '-Session', sessionId, '-Source', word, '-Quiet']), { timeoutMs: 30000 })
   }).catch(() => {})
   // The side bar by default, after the report: a person's chat in tmux or rmux. The binary refuses an agent's pane,
-  // keeps a bar the person closed closed and skips `clear` and `compact`; failures are dropped.
+  // keeps a bar the person closed closed, skips `clear` and `compact`, and leaves the bar closed while the session's
+  // team has no local agent records; failures are dropped.
   sessions = sessions.then(async () => {
     if (!(await barHere($))) return
     await $.process.run(await entryArgv($, ['sidebar', '-Auto', '-Source', word, '-Quiet']), { timeoutMs: 10000 })

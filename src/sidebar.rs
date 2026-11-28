@@ -4287,6 +4287,9 @@ fn console_utf8() {}
 /// a bar it cannot prove does not count, and the open then refuses naming it when it stands in the caller's window.
 /// Its reply adds `toggled`. Only a person's pane or the team's leader may run it (`placement::chooser`); anyone else
 /// is refused `tagged`; `-Auto` stays a person's.
+/// `-Auto` (a chat's start or resume, run by a hook) opens nothing, replying `skipped` `agents`, when the team the bar
+/// would show (the session's team, never the cwd's) has no local agent record; records present, or records or a team
+/// that cannot be read, open the bar as before.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let close = request.switch("Close");
     let toggle = request.switch("Toggle");
@@ -4312,6 +4315,17 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         crate::agents::registry::untagged(ctx, &caller, NOT_HERE)?;
     } else {
         crate::agents::placement::chooser(ctx, &caller, NOT_HERE)?;
+    }
+    // The bar by default stays closed for a team with no local agent record: nothing to show yet, and the first spawn
+    // opens the bar in its view's window. The team is the one the bar would show (`scope::as_bar`); one it cannot
+    // resolve opens as before. Local reads only, before the sidebar lock: no hc call, no lock file, no state written.
+    // Reading a team index still flushes its folders (and on Windows may probe an ancestor folder's permission with a
+    // folder made and removed at once), as every index read does.
+    if auto
+        && let Ok(bar) = scope::as_bar(ctx, &caller)
+        && crate::agents::membership::none_recorded(ctx, &bar)
+    {
+        return Ok(skipped("agents"));
     }
     lock(ctx, &scope::shown_lock("sidebar", &caller), || {
         if auto {
@@ -4651,7 +4665,8 @@ fn close_bar(ctx: &Ctx, caller: &Caller) -> Res<()> {
 }
 
 /// What started the chat, for `sidebar -Auto`: `-Source`, or `source` in the client's JSON on stdin (Copilot's
-/// `sessionStart`). None when stdin is a terminal, too long, not JSON or has no `source`: that still opens.
+/// `sessionStart`). None when stdin is a terminal, too long, not JSON or has no `source`: that is not skipped as a
+/// source.
 fn auto_source(request: &Request) -> Option<String> {
     if let Some(source) = request.value("Source") {
         return Some(source.to_string());
@@ -4662,7 +4677,8 @@ fn auto_source(request: &Request) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `sidebar -Auto` that opened nothing, and why: `source` (`clear` or `compact`) or `off` (the person closed it).
+/// `sidebar -Auto` that opened nothing, and why: `source` (`clear` or `compact`), `off` (the person closed it) or
+/// `agents` (the session's team has no local agent record).
 fn skipped(why: &str) -> Map<String, Value> {
     let mut reply = Map::new();
     reply.insert("pane".into(), Value::Null);
@@ -13250,7 +13266,11 @@ mod tests {
     }
 
     fn sidebar_world(tag: &str, mux: Mux) -> (World, Panes) {
-        let w = World::human(tag);
+        sidebar_world_of(World::human(tag), mux)
+    }
+
+    /// `sidebar_world` around a caller of the test's own (an untagged chat pane below Claude: `World::agent("")`).
+    fn sidebar_world_of(w: World, mux: Mux) -> (World, Panes) {
         let exe = w.ctx.exe.display().to_string();
         let panes: Panes = Rc::new(RefCell::new(vec![
             ("%1".to_string(), "|".to_string()),
@@ -14743,15 +14763,110 @@ mod tests {
         }
     }
 
-    // The bar by default: a person's chat that starts or resumes runs `sidebar -Auto -Source <word>`. It opens the
-    // bar as `sidebar` does, but never undoes `sidebar -Close` and never reopens after `clear` or `compact`.
+    const SKIP_AGENTS: &str = r#"ok {"pane":null,"opened":false,"skipped":"agents"}"#;
+    const OPENED: &str = r#"ok {"pane":"%7","window":"@1","opened":true}"#;
+
+    /// An hc with nothing scripted: any hc call -Auto made would be a fault `hc_done` reports.
+    fn no_hc(w: &World) {
+        w.fakes.hc_install("hc");
+    }
+
+    /// -Auto asked hc nothing.
+    fn asked_no_hc(w: &World, case: &str) {
+        assert!(
+            w.fakes.hc_calls().is_empty(),
+            "{case}: {:?}",
+            w.fakes.hc_calls()
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    /// A local agent record of the caller's team, so the bar by default opens.
+    fn seed_record(w: &World) {
+        w.agent_record(ID, json!({}));
+    }
+
+    /// `<root>/<key>/agents/<id>/record.json` = `record`, every folder made private as the product makes them.
+    fn record_at(w: &World, key: &str, id: &str, record: Value) -> std::path::PathBuf {
+        w.state();
+        let k = w.ctx.state_root.join(key);
+        let f = k.join("agents").join(id);
+        for d in [k.clone(), k.join("agents"), k.join("mail"), f.clone()] {
+            crate::agents::spawn::private_folder(&w.ctx, &d).unwrap();
+        }
+        write(&f.join("record.json"), record);
+        f
+    }
+
+    /// A lifecycle record of `session` under state key `key` (team `<key>:<session>`), with `fields` over it.
+    fn life_record(key: &str, session: &str, id: &str, fields: Value) -> Value {
+        let mut r = json!({"lifecycle": 1, "id": id, "name": "worker", "client": "claude", "session": session,
+            "sessionId": crate::agents::life_fixture::SID, "team": format!("{key}:{session}")});
+        for (k, v) in fields.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    }
+
+    /// A link at `link` to a path that does not exist (made on Unix only; the cases that need one skip elsewhere).
+    #[cfg(unix)]
+    fn dangling(link: &std::path::Path) {
+        std::os::unix::fs::symlink(link.with_extension("missing"), link).unwrap();
+    }
+    #[cfg(not(unix))]
+    fn dangling(_: &std::path::Path) {
+        unreachable!("dangling links are made on Unix only")
+    }
+
+    /// A link at `link` to `target` (made on Unix only; the cases that need one skip elsewhere).
+    #[cfg(unix)]
+    fn link_to(target: &std::path::Path, link: &std::path::Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+    #[cfg(not(unix))]
+    fn link_to(_: &std::path::Path, _: &std::path::Path) {
+        unreachable!("links are made on Unix only")
+    }
+
+    /// `dir` made a folder this user cannot list (mode 000), or `restore` it (0700). False when it still lists (as
+    /// root), and the case skips.
+    #[cfg(unix)]
+    fn unlistable(dir: &std::path::Path, restore: bool) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        if !restore {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let mode = if restore { 0o700 } else { 0o000 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        std::fs::read_dir(dir).is_err()
+    }
+    #[cfg(not(unix))]
+    fn unlistable(_: &std::path::Path, _: bool) -> bool {
+        unreachable!("unlistable folders are made on Unix only")
+    }
+
+    /// The calls a skipped -Auto never makes: a split, an option or record write (the viewed mark among them), a
+    /// pane write or kill (each inside a pid-bound if-shell), a plain kill.
+    fn auto_writes(w: &World) -> Vec<String> {
+        w.fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| {
+                ["split-window", "set-option", "if-shell", "kill-pane"].contains(&c[1].as_str())
+            })
+            .map(|c| c.join(" "))
+            .collect()
+    }
+
+    // The bar by default: a person's chat that starts or resumes runs `sidebar -Auto -Source <word>`. With a local
+    // agent record in the session's team it opens the bar as `sidebar` does, but never undoes `sidebar -Close` and
+    // never reopens after `clear` or `compact`.
     #[test]
     fn auto_opens_the_bar_then_finds_it() {
         let (w, panes) = sidebar_world("", Mux::default());
-        assert_eq!(
-            run(&w, &["-Auto", "-Source", "startup"]),
-            r#"ok {"pane":"%7","window":"@1","opened":true}"#
-        );
+        seed_record(&w);
+        no_hc(&w);
+        assert_eq!(run(&w, &["-Auto", "-Source", "startup"]), OPENED);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
         // Never unsets the option, never marks the window viewed (a chat window holds no member view).
         let lines: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
@@ -14764,31 +14879,43 @@ mod tests {
                 "{source}"
             );
         }
+        asked_no_hc(&w, "open");
     }
 
+    // A person's `off` keeps the bar closed when the team has records; with no records -Auto skips `agents` first:
+    // both open nothing. `clear` and `compact` are skipped before anything is read.
     #[test]
     fn auto_keeps_a_closed_bar_closed_and_skips_clear_and_compact() {
-        let (w, panes) = sidebar_world(
-            "",
-            Mux {
-                disabled: true,
-                ..Mux::default()
-            },
-        );
-        assert_eq!(
-            run(&w, &["-Auto", "-Source", "startup"]),
-            r#"ok {"pane":null,"opened":false,"skipped":"off"}"#
-        );
-        assert_eq!(option(&panes).as_deref(), Some("off"));
-        assert_eq!(count(&w, "split-window"), 0);
+        for (records, want) in [
+            (true, r#"ok {"pane":null,"opened":false,"skipped":"off"}"#),
+            (false, SKIP_AGENTS),
+        ] {
+            let (w, panes) = sidebar_world(
+                "",
+                Mux {
+                    disabled: true,
+                    ..Mux::default()
+                },
+            );
+            if records {
+                seed_record(&w);
+            }
+            no_hc(&w);
+            assert_eq!(run(&w, &["-Auto", "-Source", "startup"]), want);
+            assert_eq!(option(&panes).as_deref(), Some("off"));
+            assert_eq!(count(&w, "split-window"), 0);
+            asked_no_hc(&w, want);
+        }
         for source in ["clear", "compact"] {
             let (w, _) = sidebar_world("", Mux::default());
+            no_hc(&w);
             assert_eq!(
                 run(&w, &["-Auto", "-Source", source]),
                 r#"ok {"pane":null,"opened":false,"skipped":"source"}"#,
                 "{source}"
             );
             assert!(w.fakes.mux_calls().is_empty(), "{source}");
+            asked_no_hc(&w, source);
         }
     }
 
@@ -14801,19 +14928,16 @@ mod tests {
                 Some(r#"{"sessionId":"x","source":"compact"}"#),
                 r#"ok {"pane":null,"opened":false,"skipped":"source"}"#,
             ),
-            (
-                Some(r#"{"sessionId":"x","source":"new"}"#),
-                r#"ok {"pane":"%7","window":"@1","opened":true}"#,
-            ),
-            (
-                Some("not json"),
-                r#"ok {"pane":"%7","window":"@1","opened":true}"#,
-            ),
-            (None, r#"ok {"pane":"%7","window":"@1","opened":true}"#),
+            (Some(r#"{"sessionId":"x","source":"new"}"#), OPENED),
+            (Some("not json"), OPENED),
+            (None, OPENED),
         ] {
             let (w, _) = sidebar_world("", Mux::default());
+            seed_record(&w);
+            no_hc(&w);
             hooks::stdin(body.map(str::as_bytes));
             assert_eq!(run(&w, &["-Auto", "-Stdin"]), want, "{body:?}");
+            asked_no_hc(&w, want);
         }
         hooks::stdin(None);
         let (w, _) = sidebar_world("", Mux::default());
@@ -14832,12 +14956,467 @@ mod tests {
 
     #[test]
     fn auto_from_an_agent_pane_refuses_and_opens_nothing() {
+        // No local record: the managed agent's pane is still refused `tagged`, never skipped.
         let (w, panes) = sidebar_world("aaaaaaaaaaaa", Mux::default());
+        no_hc(&w);
         assert_eq!(
             run(&w, &["-Auto", "-Source", "startup"]),
             "2 tagged an agent pane cannot open the side bar"
         );
         assert_eq!(roles(&panes), "%1=|,%2=other|");
+        asked_no_hc(&w, "tagged");
+    }
+
+    // The bar by default stays closed for a team with no local agent record: no state folder, an empty one, or only
+    // records of another session of this server. Nothing is split, set, marked or locked, no state is written and hc
+    // is never asked.
+    #[test]
+    fn auto_leaves_the_bar_closed_for_a_team_with_no_local_records() {
+        use crate::agents::life_fixture as lf;
+        for case in ["no state dir", "empty team dir", "another session only"] {
+            let (w, panes) = sidebar_world("", Mux::default());
+            match case {
+                "empty team dir" => {
+                    w.state();
+                }
+                "another session only" => {
+                    let key = w.caller().server_key;
+                    let r = life_record(&key, "$9", ID, json!({"generation": "1"}));
+                    let f = record_at(&w, &key, ID, r);
+                    lf::seed_gen(&f, 1, Some("run"), lf::committed());
+                    let pre =
+                        json!({"id": "bbbbbbbbbbbb", "name": "old", "session": "$9", "pane": "%4"});
+                    record_at(&w, &key, "bbbbbbbbbbbb", pre);
+                }
+                _ => {}
+            }
+            no_hc(&w);
+            let before = crate::testing::tree(&w.ctx.state_root);
+            assert_eq!(
+                run(&w, &["-Auto", "-Source", "startup"]),
+                SKIP_AGENTS,
+                "{case}"
+            );
+            assert_eq!(auto_writes(&w), Vec::<String>::new(), "{case}");
+            assert!(w.fakes.locks().is_empty(), "{case}: {:?}", w.fakes.locks());
+            assert_eq!(roles(&panes), "%1=|,%2=other|", "{case}");
+            assert!(
+                crate::testing::tree(&w.ctx.state_root) == before,
+                "{case}: no state written"
+            );
+            if case == "no state dir" {
+                assert!(!w.ctx.state_root.exists(), "{case}");
+            }
+            asked_no_hc(&w, case);
+        }
+    }
+
+    // A missing state root is no records only when it is surely absent: the nearest ancestor with an entry is a
+    // folder, followed through a link. A state root that is a dangling link, or lies beneath one, or is a file, is not
+    // proven empty, so it opens as 0.5.0 did (a file root refuses, as 0.5.0 refused it). A fresh root missing under a
+    // real folder, or under a valid link to one, skips.
+    #[test]
+    fn auto_skips_only_a_state_root_that_is_surely_absent() {
+        // (case, Unix only: it needs a link)
+        for (case, unix_only) in [
+            ("dangling state root", true),
+            ("state root beneath a dangling link", true),
+            ("state root is a file", false),
+            ("missing under a folder", false),
+            ("missing under a valid link", true),
+        ] {
+            if unix_only && cfg!(not(unix)) {
+                continue;
+            }
+            let (mut w, panes) = sidebar_world("", Mux::default());
+            let base = w.ctx.state_root.parent().unwrap().to_path_buf();
+            w.ctx.state_root = match case {
+                "dangling state root" => {
+                    let root = base.join("gone-root");
+                    dangling(&root);
+                    root
+                }
+                "state root beneath a dangling link" => {
+                    let above = base.join("gone-parent");
+                    dangling(&above);
+                    above.join("state")
+                }
+                "state root is a file" => {
+                    let root = base.join("state-file");
+                    std::fs::write(&root, b"not a folder").unwrap();
+                    root
+                }
+                "missing under a folder" => base.join("fresh").join("state"),
+                _ => {
+                    let real = base.join("real");
+                    std::fs::create_dir(&real).unwrap();
+                    let linked = base.join("linked");
+                    link_to(&real, &linked);
+                    linked.join("state")
+                }
+            };
+            let want = match case {
+                "dangling state root" | "state root beneath a dangling link" => OPENED.to_string(),
+                // The team index read refuses a file root first, as in 0.5.0.
+                "state root is a file" => format!(
+                    "1 index {} is not a real folder",
+                    w.ctx.state_root.display()
+                ),
+                _ => SKIP_AGENTS.to_string(),
+            };
+            no_hc(&w);
+            let got = run(&w, &["-Auto", "-Source", "resume"]);
+            assert_eq!(got, want, "{case}");
+            if want == SKIP_AGENTS {
+                assert_eq!(auto_writes(&w), Vec::<String>::new(), "{case}");
+                assert!(w.fakes.locks().is_empty(), "{case}");
+                assert!(!w.ctx.state_root.exists(), "{case}: no state written");
+                assert_eq!(roles(&panes), "%1=|,%2=other|", "{case}");
+            }
+            asked_no_hc(&w, case);
+        }
+    }
+
+    // The team's `agents` folder is looked at, then listed: one gone in between (moved away, swapped for a dangling
+    // link, or replaced by a readable link to an empty folder) is no proof of no records, so the bar opens as before.
+    #[test]
+    fn auto_opens_when_the_agents_folder_goes_between_look_and_list() {
+        use crate::agents::membership::list_hooks;
+        // (case, Unix only: it needs a dangling link or an inode compare)
+        for (case, unix_only) in [
+            ("moved away", false),
+            ("swapped for a dangling link", true),
+            // A link on Windows too: `link_dir` makes a directory symlink, else a junction (never skips).
+            ("replaced by a link to an empty folder", false),
+            // Another real folder: told apart by device and inode on Unix (Windows' std has none; not checked there).
+            ("replaced by another empty folder", true),
+        ] {
+            if unix_only && cfg!(not(unix)) {
+                continue;
+            }
+            let (w, panes) = sidebar_world("", Mux::default());
+            seed_record(&w);
+            list_hooks::before_list(Some(Box::new(move |agents: &std::path::Path| {
+                std::fs::rename(agents, agents.with_extension("away")).unwrap();
+                match case {
+                    "swapped for a dangling link" => dangling(agents),
+                    "replaced by a link to an empty folder" => {
+                        let empty = agents.with_extension("empty");
+                        std::fs::create_dir(&empty).unwrap();
+                        crate::testing::link_dir(&empty, agents);
+                    }
+                    "replaced by another empty folder" => std::fs::create_dir(agents).unwrap(),
+                    _ => {}
+                }
+            })));
+            no_hc(&w);
+            let got = run(&w, &["-Auto", "-Source", "resume"]);
+            list_hooks::before_list(None);
+            assert_eq!(got, OPENED, "{case}");
+            assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|", "{case}");
+            asked_no_hc(&w, case);
+        }
+    }
+
+    // Presence is enough: any local record of the session's team, in any state, opens the bar as before; so does an
+    // entry that cannot be read. Nothing deeper is read to decide, and hc is never asked.
+    #[test]
+    fn auto_opens_beside_any_local_record() {
+        use crate::agents::{life_fixture as lf, prelife_fixture as pf};
+        // (case, Unix only: it needs a link)
+        for (case, unix_only) in [
+            ("no generations", false),
+            ("committed", false),
+            ("uncommitted", false),
+            ("pending", false),
+            ("orphan only", false),
+            ("held legacy", false),
+            ("0.2.x", false),
+            ("torn record", false),
+            ("no record file", false),
+            ("finished", false),
+            ("agents dangling link", true),
+            ("key dangling link", true),
+        ] {
+            if unix_only && cfg!(not(unix)) {
+                continue;
+            }
+            let (w, panes) = sidebar_world("", Mux::default());
+            let key = w.caller().server_key;
+            let life = |fields: Value| life_record(&key, "$3", ID, fields);
+            match case {
+                "no generations" => {
+                    record_at(&w, &key, ID, life(json!({})));
+                }
+                "committed" | "uncommitted" => {
+                    let f = record_at(&w, &key, ID, life(json!({"generation": "1"})));
+                    let commit = (case == "committed").then(lf::committed).flatten();
+                    lf::seed_gen(&f, 1, Some("run"), commit);
+                }
+                "pending" => {
+                    record_at(&w, &key, ID, life(json!({"pending": lf::pending(1)})));
+                }
+                "orphan only" => {
+                    let f = record_at(&w, &key, ID, life(json!({})));
+                    lf::seed_gen(&f, 1, Some("run"), None);
+                }
+                "held legacy" => {
+                    let held = json!({"id": ID, "name": "old", "session": "$3", "hcAddress": "t1"});
+                    record_at(&w, &key, ID, held);
+                }
+                "0.2.x" => pf::v028(&w, pf::P, "old", pf::End::Exited),
+                "torn record" => {
+                    let f = record_at(&w, &key, ID, life(json!({})));
+                    std::fs::remove_file(f.join("record.json")).unwrap();
+                    std::fs::write(f.join("record.json"), b"{").unwrap();
+                }
+                // Its only generation ended by recorded evidence: the team is finished, and still has a record.
+                "finished" => {
+                    let f = record_at(&w, &key, ID, life(json!({"generation": "1"})));
+                    lf::seed_gen(&f, 1, Some("run"), lf::committed());
+                    let end = json!({"address": "t1", "hcName": lf::hc_name(1), "labels": {},
+                        "state": "finished", "reason": "exited", "exitCode": 0, "at": "x"});
+                    let at = crate::agents::gens::path(&f, 1, "ended");
+                    crate::state::evidence::publish(&at, &end).unwrap();
+                }
+                // Only a folder that is truly absent is no records: a dangling link is not.
+                "agents dangling link" => {
+                    let agents = w.state().join("agents");
+                    std::fs::remove_dir(&agents).unwrap();
+                    dangling(&agents);
+                }
+                "key dangling link" => {
+                    crate::agents::spawn::private_folder(&w.ctx, &w.ctx.state_root).unwrap();
+                    dangling(&w.ctx.state_root.join(&key));
+                }
+                _ => {
+                    let f = record_at(&w, &key, ID, life(json!({})));
+                    std::fs::remove_file(f.join("record.json")).unwrap();
+                }
+            }
+            no_hc(&w);
+            assert_eq!(run(&w, &["-Auto", "-Source", "startup"]), OPENED, "{case}");
+            assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|", "{case}");
+            asked_no_hc(&w, case);
+        }
+    }
+
+    // A retained 0.2.x record opens the bar whatever its pane shows (live, gone, or another command): presence is
+    // enough, so nothing checks its pane; the one pane list is the agent-pane check's, as in 0.5.0.
+    #[test]
+    fn auto_opens_beside_a_retained_v028_record_whatever_its_pane() {
+        use crate::agents::prelife_fixture::{self as pf, Pane028};
+        for pane in [Pane028::Live, Pane028::Gone, Pane028::Other] {
+            let (w, panes) = sidebar_world("", Mux::default());
+            pf::v028(&w, pf::P, "old", pf::End::Live);
+            w.fakes.process(crate::testing::row(31337, 100, 1000));
+            let record: Value = crate::state::fs::read_json(&w.folder(pf::P).join("record.json"))
+                .unwrap()
+                .unwrap();
+            let command = match pane {
+                Pane028::Other => "/bin/sh".to_string(),
+                _ => record["startCommand"].as_str().unwrap().to_string(),
+            };
+            let rows = match pane {
+                Pane028::Gone => Vec::new(),
+                _ => vec![crate::agents::fixture::Listed {
+                    pane: "%9".into(),
+                    window: "@5".into(),
+                    pid: "31337".into(),
+                    dead: false,
+                    command,
+                    tag: pf::P.into(),
+                    name: "old".into(),
+                }],
+            };
+            w.fakes.mux_script("#{pane_start_command}", move |argv| {
+                let listed = crate::agents::fixture::listed_rows(argv, &rows, "\n");
+                Ok(out(0, &listed, ""))
+            });
+            no_hc(&w);
+            assert_eq!(
+                run(&w, &["-Auto", "-Source", "startup"]),
+                OPENED,
+                "{pane:?}"
+            );
+            assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|", "{pane:?}");
+            let lists = w
+                .fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| snapshot_list(c))
+                .count();
+            assert_eq!(
+                lists, 1,
+                "{pane:?}: only the agent-pane check lists the panes"
+            );
+            assert!(
+                !w.fakes
+                    .mux_calls()
+                    .iter()
+                    .any(|c| c.iter().any(|a| a.starts_with("kill-pane"))),
+                "{pane:?}"
+            );
+            asked_no_hc(&w, "0.2.x");
+        }
+    }
+
+    // "That folder" is the team the bar shows. A person's chat pane runs below its client, so it resolves as an agent
+    // and is never admitted; the bar's watch, in a split of the same session, is admitted as a person. In a session
+    // that is a team's proven view, the records read are the team anchor's, never the shown session's own folder. A
+    // team the bar cannot resolve, or records it cannot list, open as before.
+    #[test]
+    fn auto_reads_the_records_of_the_team_the_bar_shows() {
+        use crate::agents::session_report::hooks;
+        use crate::agents::up::index::{self, Index, Inputs, View};
+        const K1: &str = "a1a1a1a1a1a1a1a1";
+        use crate::agents::life_fixture as lf;
+        // (case, Unix only: it needs a link or a folder mode, the reply)
+        for (case, unix_only, want) in [
+            ("anchor record", false, OPENED),
+            ("anchor agents is a file", false, OPENED),
+            ("anchor agents dangling link", true, OPENED),
+            ("anchor agents unlistable", true, OPENED),
+            ("anchor key dangling link", true, OPENED),
+            ("anchor key without agents", false, SKIP_AGENTS),
+            ("own folder only", false, SKIP_AGENTS),
+            ("index torn", false, OPENED),
+            // 0.5.0 never admitted a chat pane, so its own folder decided it: an anchor record whose view names the
+            // caller's pane is no reason to refuse it now (no ownership check against the anchor's records).
+            ("anchor owns the caller's pane", false, OPENED),
+        ] {
+            if unix_only && cfg!(not(unix)) {
+                continue;
+            }
+            for args in [&["-Auto", "-Source", "startup"][..], &["-Auto", "-Stdin"]] {
+                let (w, panes) = sidebar_world_of(World::agent(""), Mux::default());
+                let view = View {
+                    server: index::server_of(&w.caller()),
+                    session: "$3".into(),
+                    name: "p-01234567-v".into(),
+                };
+                let ix = Index {
+                    team: "1111111111111111".into(),
+                    inputs: Inputs {
+                        client: "claude".into(),
+                        options: vec![],
+                        prompt: vec![],
+                        name: String::new(),
+                        folder: "/p".into(),
+                    },
+                    anchor: Some(crate::caller::Anchor {
+                        key: K1.into(),
+                        session: "$A".into(),
+                    }),
+                    view: Some(view),
+                    pending: None,
+                    aliases: vec![],
+                    releases: vec![],
+                };
+                index::write(&w.ctx, &ix).unwrap();
+                match case {
+                    "anchor record" => {
+                        record_at(&w, K1, ID, life_record(K1, "$A", ID, json!({})));
+                    }
+                    "anchor agents is a file" => {
+                        let k1 = w.ctx.state_root.join(K1);
+                        crate::agents::spawn::private_folder(&w.ctx, &k1).unwrap();
+                        std::fs::write(k1.join("agents"), b"not a folder").unwrap();
+                    }
+                    "anchor agents dangling link" => {
+                        let k1 = w.ctx.state_root.join(K1);
+                        crate::agents::spawn::private_folder(&w.ctx, &k1).unwrap();
+                        dangling(&k1.join("agents"));
+                    }
+                    "anchor key dangling link" => dangling(&w.ctx.state_root.join(K1)),
+                    "anchor agents unlistable" => {
+                        let k1 = w.ctx.state_root.join(K1);
+                        crate::agents::spawn::private_folder(&w.ctx, &k1).unwrap();
+                        if !unlistable(&k1.join("agents"), false) {
+                            unlistable(&k1.join("agents"), true);
+                            continue; // run as root: every folder lists
+                        }
+                    }
+                    "anchor key without agents" => {
+                        let k1 = w.ctx.state_root.join(K1);
+                        crate::agents::spawn::private_folder(&w.ctx, &k1).unwrap();
+                    }
+                    "anchor owns the caller's pane" => {
+                        let address = format!("t{ID}");
+                        let fields = json!({"generation": "1", "hcAddress": address, "hcName": lf::hc_name(1)});
+                        let f = record_at(&w, K1, ID, life_record(K1, "$A", ID, fields));
+                        lf::seed_gen(&f, 1, Some("run"), lf::committed());
+                        crate::agents::view_bind_tests::view_file(
+                            &w,
+                            &f,
+                            1,
+                            "%1",
+                            &address,
+                            &lf::hc_name(1),
+                        );
+                    }
+                    "own folder only" => seed_record(&w),
+                    _ => {
+                        let path = index::path(&w.ctx, &ix.team);
+                        std::fs::remove_file(&path).unwrap();
+                        std::fs::write(&path, b"{").unwrap();
+                    }
+                }
+                no_hc(&w);
+                hooks::stdin(Some(br#"{"sessionId":"x","source":"startup"}"#));
+                let got = run(&w, args);
+                hooks::stdin(None);
+                if case == "anchor agents unlistable" {
+                    unlistable(&w.ctx.state_root.join(K1).join("agents"), true);
+                }
+                assert_eq!(got, want, "{case} {args:?}");
+                if want == SKIP_AGENTS {
+                    assert_eq!(roles(&panes), "%1=|,%2=other|", "{case} {args:?}");
+                }
+                asked_no_hc(&w, case);
+            }
+        }
+    }
+
+    // Only -Auto looks for records: `sidebar`, `sidebar -Toggle` and a spawn's `ensure` open the bar with none.
+    #[test]
+    fn plain_toggle_and_ensure_open_with_no_records() {
+        let (w, _) = sidebar_world("", Mux::default());
+        no_hc(&w);
+        assert_eq!(run(&w, &[]), OPENED);
+        asked_no_hc(&w, "sidebar");
+        let (w, _) = sidebar_world("", Mux::default());
+        assert_eq!(
+            run(&w, &["-Toggle"]),
+            r#"ok {"pane":"%7","window":"@1","opened":true,"toggled":"opened"}"#
+        );
+        let (w, _) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_run(&w), "opened %7");
+    }
+
+    // Copilot's sessionStart passes `{"source":"resume"}` on stdin: with no local record it skips exactly as
+    // `-Source resume` does, and changes nothing.
+    #[test]
+    fn auto_from_stdin_skips_as_source_does() {
+        use crate::agents::session_report::hooks;
+        for args in [&["-Auto", "-Stdin"][..], &["-Auto", "-Source", "resume"]] {
+            let (w, panes) = sidebar_world("", Mux::default());
+            w.state();
+            no_hc(&w);
+            let before = crate::testing::tree(&w.ctx.state_root);
+            hooks::stdin(Some(br#"{"sessionId":"x","source":"resume"}"#));
+            let got = run(&w, args);
+            hooks::stdin(None);
+            assert_eq!(got, SKIP_AGENTS, "{args:?}");
+            assert_eq!(auto_writes(&w), Vec::<String>::new(), "{args:?}");
+            assert!(w.fakes.locks().is_empty(), "{args:?}");
+            assert_eq!(roles(&panes), "%1=|,%2=other|", "{args:?}");
+            assert!(
+                crate::testing::tree(&w.ctx.state_root) == before,
+                "{args:?}"
+            );
+            asked_no_hc(&w, "stdin");
+        }
     }
 
     #[test]

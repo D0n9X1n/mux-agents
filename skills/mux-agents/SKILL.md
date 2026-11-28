@@ -23,7 +23,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - Report results to your parent with `send parent`.
 - As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.
 - When the user wants agents as tabs first, run `placement tab`; as panes first, run `placement h` (or `v`). It lasts for the session. Splits keep the user's pane the largest: three agents fit beside it, and further agents open as tabs.
-- A narrow side bar beside you shows how many agents run and what each is doing. It opens when the person's chat starts in tmux or rmux, and on the first `spawn`. `sidebar -Close` closes it in every window of the session; `sidebar` opens it again, and every agent window gets its own; `sidebar -Toggle` closes it when any shows, else opens it. The person types `/mux-agents-sidebar` in Claude Code, or `/mux-agents:sidebar` in Copilot CLI, for the same.
+- A narrow side bar beside you shows how many agents run and what each is doing. It opens when the person's chat starts in tmux or rmux (unless the session's team has no local agent records yet), and on the first `spawn`. `sidebar -Close` closes it in every window of the session; `sidebar` opens it again, and every agent window gets its own; `sidebar -Toggle` closes it when any shows, else opens it. The person types `/mux-agents-sidebar` in Claude Code, or `/mux-agents:sidebar` in Copilot CLI, for the same.
 - Never type into panes.
 - Run `focus` only when the user asks.
 - In a team (started with `up`), a member may spawn its own children, down to depth 3, while the team has fewer than 10 members besides the leader and spawn budget left. Outside a team, children cannot spawn.

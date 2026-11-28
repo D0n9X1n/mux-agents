@@ -94,13 +94,7 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
             Member::Pre(r) => r,
             Member::Life(g) => g.record(),
         };
-        // prelife-1c ambiguity 5: a record naming another session is skipped; one naming none (or not an object)
-        // is the caller's (fail closed).
-        if record
-            .get("session")
-            .and_then(Value::as_str)
-            .is_some_and(|s| s != super::scope::state(caller).session)
-        {
+        if elsewhere(record, caller) {
             continue;
         }
         let one = match &member {
@@ -164,6 +158,133 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
         pre_ended,
         pre,
     })
+}
+
+/// prelife-1c ambiguity 5: a record naming another session is skipped; one naming none (or not an object) is the
+/// caller's (fail closed).
+fn elsewhere(record: &Value, caller: &Caller) -> bool {
+    record
+        .get("session")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != super::scope::state(caller).session)
+}
+
+/// `sidebar -Auto`: whether the caller's team has no local agent record at all, from its member folders alone (no
+/// hc call, no generation or status read). Presence is enough: any member folder whose record is not a readable
+/// record of another session counts, whatever its state (a lifecycle or pre-lifecycle record, with or without
+/// generations, held, orphaned or finished), and so does a folder with no record yet or one that cannot be read. The
+/// key and `agents` folders are looked at themselves first (never through a link): one with no entry is no records
+/// only when it is surely absent (`surely_absent`); a dangling link, a file, a link or any other answer counts, as
+/// does a folder that cannot be listed. True only when the team surely has none.
+pub fn none_recorded(ctx: &Ctx, caller: &Caller) -> bool {
+    use super::gens::Member;
+    let key = super::server_dir(ctx, caller);
+    let agents = key.join("agents");
+    let mut looked = None;
+    for at in [&key, &agents] {
+        match std::fs::symlink_metadata(at) {
+            Ok(m) if m.is_dir() => looked = Some(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return surely_absent(at),
+            _ => return false,
+        }
+    }
+    let Some(looked) = looked else {
+        return false;
+    };
+    #[cfg(test)]
+    list_hooks::fire(&agents);
+    // Listed here, not through `gens::members`, which reads a folder gone since the look above as empty: any listing
+    // error, the folder missing now included, is no proof of no records.
+    let Ok(entries) = std::fs::read_dir(&agents) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !super::agent_id(&id) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => continue,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        let counts = match super::gens::member_of(&entry.path()) {
+            Member::Pre(r) => !elsewhere(&r, caller),
+            Member::Life(g) => !elsewhere(g.record(), caller),
+            Member::Absent | Member::Unreadable(_) => true,
+        };
+        if counts {
+            return false;
+        }
+    }
+    // Still the folder looked at before the listing, not a link or another folder swapped in while it was listed. The
+    // state folder is the person's own private folder: a writer who can swap it could as well empty it, and a false
+    // skip only means the bar does not open on its own (a spawn or `/mux-agents-sidebar` still opens it). A swap
+    // reversed while the listing runs is not seen.
+    std::fs::symlink_metadata(&agents).is_ok_and(|now| same_folder(&looked, &now))
+}
+
+/// Whether two `symlink_metadata` answers are one real folder: both folders, neither a link; on Unix the same device
+/// and inode. Windows' std has no stable file id, so there both must be folders that are no reparse point (a link or
+/// a junction); one real folder swapped for another is not told apart there.
+fn same_folder(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    let real = |m: &std::fs::Metadata| m.is_dir() && !m.file_type().is_symlink();
+    if !real(a) || !real(b) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        (a.file_attributes() | b.file_attributes()) & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+}
+
+/// Test hook: runs between `none_recorded`'s look at `agents` and its listing, so a racer can swap the folder.
+#[cfg(test)]
+pub(crate) mod list_hooks {
+    use std::cell::RefCell;
+    use std::path::Path;
+    pub(crate) type Hook = Box<dyn Fn(&Path)>;
+    thread_local! {
+        static BEFORE_LIST: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn before_list(hook: Option<Hook>) {
+        BEFORE_LIST.with(|h| *h.borrow_mut() = hook);
+    }
+    pub(super) fn fire(agents: &Path) {
+        BEFORE_LIST.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(agents);
+            }
+        });
+    }
+}
+
+/// Whether `missing` (a path `symlink_metadata` found no entry for) is surely absent. A dangling link at or above it
+/// also answers no entry, and the state root may be kept through one, so the nearest ancestor with an entry (looked
+/// at without following links) must be a folder when followed: then nothing below it exists. A dangling link, a
+/// file, any error, or no ancestor with an entry up to the root: not proven.
+fn surely_absent(missing: &std::path::Path) -> bool {
+    let mut at = missing.parent();
+    while let Some(dir) = at.filter(|d| !d.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => return std::fs::metadata(dir).is_ok_and(|m| m.is_dir()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => at = dir.parent(),
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// R1-R4: one `status`, the subject generation's identity, commit and notice (each read once), and its

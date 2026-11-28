@@ -177,7 +177,7 @@ if [ "$n" = 3 ] && [ -z "$why" ]; then ok sidebar_skill_commands_run_through_shi
 # the plugin root. Every hook reports through the shim, never fails the turn, and maps Copilot's events as herdr's
 # agents report: a prompt works, a question blocks until answered, a stop idles. Session start names the session
 # (report-2b K3): `report -Session -Stdin` reads Copilot's JSON from stdin, with 30 s for its readiness wait; then
-# `sidebar -Auto -Stdin` opens the side bar by default from the same JSON's `source`.
+# `sidebar -Auto -Stdin` runs the side bar by default from the same JSON's `source`.
 copilot_hooks_report_through_the_shim() {
   name=copilot_hooks_report_through_the_shim
   hooks="$repo/hooks.json"

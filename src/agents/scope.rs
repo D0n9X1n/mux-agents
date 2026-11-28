@@ -139,6 +139,22 @@ pub fn admit(ctx: &Ctx, c: &mut Caller) -> Res<()> {
     Ok(())
 }
 
+/// The caller as the side bar beside it reads the team, for `sidebar -Auto`'s choice of records. The bar's `watch`
+/// runs in a split of the caller's session under no client, so it resolves as a person and `admit` gives it the
+/// anchor of a team whose proven view that session is. A person's chat pane runs below its client, so it resolves as
+/// an agent and is never admitted: read as it is, it would name the shown session's own folder, not the team the bar
+/// shows. Such a caller (no member, no anchor) is admitted as a person; only the anchor is taken. A refusal is
+/// `admit`'s (`moved`, `index`).
+pub fn as_bar(ctx: &Ctx, c: &Caller) -> Res<Caller> {
+    let mut bar = c.clone();
+    if c.kind == Kind::Agent && c.member.is_none() && c.anchor.is_none() {
+        bar.kind = Kind::Human;
+        admit(ctx, &mut bar)?;
+        bar.kind = c.kind;
+    }
+    Ok(bar)
+}
+
 /// What presents a proven lifecycle member (E2; calls 18, 46).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shown {

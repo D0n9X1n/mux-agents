@@ -200,7 +200,7 @@ fn a_terminal_stdin_is_refused_without_reading() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// The second `sessionStart` hook opens the side bar by default from the same JSON. Outside tmux and rmux the caller
+// The second `sessionStart` hook runs the side bar by default from the same JSON. Outside tmux and rmux the caller
 // resolves to no pane and the verb refuses `endpoint` (nothing opened); a `compact` start is skipped before any lookup.
 #[cfg(unix)]
 #[test]

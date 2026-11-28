@@ -2161,6 +2161,38 @@ exec claude --dangerously-skip-permissions
         bar_clean(&live, &bar, &screen);
     }
 
+    // The bar by default stays closed for a team with no local agent record, from local reads alone: with the
+    // private core stopped, a chat start skips `agents`, the core's socket still answers nothing (no hc call started
+    // it) and no state folder is made.
+    fn auto_skips_a_team_with_no_records_and_starts_no_core(mux: Mux) {
+        use std::os::unix::net::UnixStream;
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let socket = live.dir.join("h.sock");
+        assert!(
+            live.server.core.as_mut().unwrap().stop(),
+            "{mux:?}: core stop"
+        );
+        assert!(
+            UnixStream::connect(&socket).is_err(),
+            "{mux:?}: the core is down"
+        );
+        let (code, reply) = live.run(&["sidebar", "-Auto", "-Source", "startup"]);
+        let started = UnixStream::connect(&socket).is_ok();
+        if started {
+            // A failed run must not leave a core behind: stop the one the run started.
+            let _ = core(&live, &["server", "stop", "--json"]);
+        }
+        assert!(!started, "{mux:?}: -Auto started hc's core: {reply}");
+        assert_eq!(
+            (code, &reply["opened"], &reply["skipped"]),
+            (0, &json!(false), &json!("agents")),
+            "{mux:?}: {reply}"
+        );
+        assert!(!live.state().exists(), "{mux:?}: no state written");
+    }
+
     // The first spawn beside the caller opens its window's one bar at the right edge, `bar_width` columns, showing
     // the count and each status, outside list; the next spawn in that window and sidebar answer the same bar; -Close
     // ends it and its watch.
@@ -7173,6 +7205,12 @@ hc {}:
         [close_spares_another_roots_managed_watch]
     );
     tests_on!(rmux_roots, Rmux, [close_spares_another_roots_managed_watch]);
+    // The bar by default reads only local records: a team with none skips, and a stopped core stays stopped.
+    tests_on!(
+        tmux38_auto,
+        Tmux38,
+        [auto_skips_a_team_with_no_records_and_starts_no_core]
+    );
 
     // tmux 3.2a's display-popup has no -T (QA): peek works there too.
     tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);

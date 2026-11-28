@@ -106,11 +106,12 @@ test('a later session report waits for an earlier one that is still running', as
   expect(finished).toEqual([SID, SID2])
 })
 
-// The bar by default: a person's chat that starts or resumes in tmux or rmux opens the side bar, after its session
-// report and never awaited. The binary keeps a bar the person closed closed and skips `clear` and `compact`; the hook
-// passes the source on. Outside tmux and rmux (an hc terminal, no multiplexer) nothing opens it.
+// The bar by default: a person's chat that starts or resumes in tmux or rmux invokes `sidebar -Auto`, after its
+// session report and never awaited. The binary decides: it keeps a bar the person closed closed, skips `clear` and
+// `compact`, and leaves the bar closed while the session's team has no local agent records; the hook passes the source
+// on. Outside tmux and rmux (an hc terminal, no multiplexer) nothing invokes it.
 for (const env of [{ TMUX: 'x' }, { RMUX: 'x' }]) {
-  test(`inside ${Object.keys(env)[0]} a SessionStart opens the side bar after the session report`, async ($, on) => {
+  test(`inside ${Object.keys(env)[0]} a SessionStart invokes sidebar -Auto after the session report`, async ($, on) => {
     const { seen, clock } = world(on, env, 60000)
     await ($ as any).classic.SessionStart({ source: 'resume', session_id: SID })
     await clock.settle()
